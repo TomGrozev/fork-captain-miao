@@ -2085,22 +2085,29 @@ pub(super) fn host_tally_spans(
     spans
 }
 
+fn vcs_label(name: &str) -> Span<'static> {
+    Span::styled(
+        format!("{name:<9}"),
+        Style::default().add_modifier(Modifier::DIM),
+    )
+}
+
 fn vcs_field(name: &str, value: &str, value_style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("{name:<9}"),
-            Style::default().add_modifier(Modifier::DIM),
-        ),
+        vcs_label(name),
         Span::styled(value.to_string(), value_style),
     ])
 }
 
-/// Branch, upstream, ahead, behind, and the tree. Color is on the value.
+/// Branch, upstream, how far the checkout has diverged, and the working tree.
+/// Color is on the value.
 ///
-/// Behind the remote needs attention. Ahead of it is information. Both at
-/// once means a fast-forward pull cannot land, so that is an error, as are
-/// conflicts and an operation in progress. Dirty or detached needs attention.
-/// In sync and clean stays dim.
+/// `↑` is commits to push and `↓` is commits the remote has, as in lazygit. A
+/// zero side is left off. Behind the remote needs attention. Ahead of it is
+/// information. Both at once means a fast-forward pull cannot land, so that
+/// is an error. Conflicts or an operation in progress are an error too, and
+/// they share the tree row with dirty or clean. Detached needs attention. In
+/// sync and clean stays dim.
 fn vcs_ready_lines(
     snap: &cm_core::vcs::VcsSnapshot,
     ui: &crate::config::UiColors,
@@ -2109,7 +2116,6 @@ fn vcs_ready_lines(
     let attention = Style::default().fg(ui.attention_fg);
     let error = Style::default().fg(ui.error_fg);
     let info = Style::default().fg(ui.header_fg);
-    let diverged = snap.ahead > 0 && snap.behind > 0;
     let branch = if snap.detached {
         match snap.head.as_deref() {
             Some(head) => format!("{head} (detached)"),
@@ -2117,20 +2123,6 @@ fn vcs_ready_lines(
         }
     } else {
         snap.head.clone().unwrap_or_else(|| "—".to_string())
-    };
-    let ahead_style = if diverged {
-        error
-    } else if snap.ahead > 0 {
-        info
-    } else {
-        dim
-    };
-    let behind_style = if diverged {
-        error
-    } else if snap.behind > 0 {
-        attention
-    } else {
-        dim
     };
     let mut lines = vec![
         vcs_field(
@@ -2151,24 +2143,78 @@ fn vcs_ready_lines(
                 Style::default()
             },
         ),
-        vcs_field("Ahead", &snap.ahead.to_string(), ahead_style),
-        vcs_field("Behind", &snap.behind.to_string(), behind_style),
+        vcs_sync_line(snap, dim, attention, error, info),
     ];
-    if let Some(operation) = &snap.operation {
-        lines.push(vcs_field("Operation", operation, error));
-    }
     if let Some(workspace) = &snap.workspace {
         lines.push(vcs_field("Worktree", workspace, Style::default()));
     }
-    let (tree, tree_style) = if snap.conflicts {
-        ("conflicts", error)
-    } else if snap.dirty {
-        ("dirty", attention)
-    } else {
-        ("clean", dim)
-    };
-    lines.push(vcs_field("Tree", tree, tree_style));
+    lines.push(vcs_field(
+        "Tree",
+        &vcs_tree_value(snap),
+        vcs_tree_style(snap, ui),
+    ));
     lines
+}
+
+/// `↑n` commits this checkout has that the upstream does not, `↓n` the other
+/// way. In sync is a check mark. No upstream has nothing to count.
+fn vcs_sync_line(
+    snap: &cm_core::vcs::VcsSnapshot,
+    dim: Style,
+    attention: Style,
+    error: Style,
+    info: Style,
+) -> Line<'static> {
+    let mut spans = vec![vcs_label("Sync")];
+    if snap.upstream.is_none() {
+        spans.push(Span::styled("—", dim));
+        return Line::from(spans);
+    }
+    if snap.ahead == 0 && snap.behind == 0 {
+        spans.push(Span::styled("✓", dim));
+        return Line::from(spans);
+    }
+    let diverged = snap.ahead > 0 && snap.behind > 0;
+    let ahead_style = if diverged { error } else { info };
+    let behind_style = if diverged { error } else { attention };
+    if snap.ahead > 0 {
+        spans.push(Span::styled(format!("↑{}", snap.ahead), ahead_style));
+    }
+    if snap.behind > 0 {
+        if snap.ahead > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!("↓{}", snap.behind), behind_style));
+    }
+    Line::from(spans)
+}
+
+/// Clean, dirty, or conflicted, plus an in-progress operation when there is
+/// one. Both describe the working tree, so they share a row.
+fn vcs_tree_value(snap: &cm_core::vcs::VcsSnapshot) -> String {
+    let condition = if snap.conflicts {
+        Some("conflicts")
+    } else if snap.dirty {
+        Some("dirty")
+    } else {
+        None
+    };
+    match (condition, snap.operation.as_deref()) {
+        (Some(condition), Some(operation)) => format!("{condition}, {operation}"),
+        (Some(condition), None) => condition.to_string(),
+        (None, Some(operation)) => operation.to_string(),
+        (None, None) => "clean".to_string(),
+    }
+}
+
+fn vcs_tree_style(snap: &cm_core::vcs::VcsSnapshot, ui: &crate::config::UiColors) -> Style {
+    if snap.conflicts || snap.operation.is_some() {
+        Style::default().fg(ui.error_fg)
+    } else if snap.dirty {
+        Style::default().fg(ui.attention_fg)
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    }
 }
 
 fn vcs_outcome_style(snap: &cm_core::vcs::VcsSnapshot, ui: &crate::config::UiColors) -> Style {

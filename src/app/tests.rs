@@ -7307,7 +7307,6 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 
 #[test]
 fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
-    use ratatui::style::Modifier;
     let mut d = TestDashboard::new(160, 40);
     d.app.panels_initialized = true;
     d.app.detail_visible = true;
@@ -7359,16 +7358,14 @@ fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
         let (x, y) = find_cell(buf, label).unwrap_or_else(|| panic!("{label} not drawn"));
         buf[(x + 9, y)].style()
     };
-    // Ahead of the remote, and not behind it: information, not a warning.
-    assert_eq!(value_style(&d, "Ahead").fg, Some(ui.header_fg));
-    assert!(
-        value_style(&d, "Behind")
-            .add_modifier
-            .contains(Modifier::DIM)
-    );
+    // Ahead of the remote, and not behind it: `↑` is information. The zero
+    // side is left off, the way lazygit draws it.
+    assert!(out.contains("↑2"), "{out}");
+    assert!(!out.contains('↓'), "{out}");
+    assert!(!out.contains('✓'), "{out}");
+    assert_eq!(value_style(&d, "Sync").fg, Some(ui.header_fg));
 
-    // Behind the remote needs attention. Ahead and behind is an error: a
-    // fast-forward pull cannot land.
+    // Behind the remote needs attention. A dirty tree does too, on its own row.
     let behind = cm_core::vcs::VcsSnapshot {
         outcome: cm_core::vcs::VcsOutcome::Ready,
         system: Some("git".into()),
@@ -7389,10 +7386,18 @@ fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
             ..Default::default()
         },
     );
-    d.render();
-    assert_eq!(value_style(&d, "Behind").fg, Some(ui.attention_fg));
+    let out = d.render();
+    assert!(out.contains("↓4"), "{out}");
+    assert!(!out.contains('↑'), "{out}");
+    assert_eq!(value_style(&d, "Sync").fg, Some(ui.attention_fg));
     assert_eq!(value_style(&d, "Tree").fg, Some(ui.attention_fg));
+    assert!(out.contains("dirty"), "{out}");
+    assert!(
+        !out.contains("Operation"),
+        "the operation shares the tree row"
+    );
 
+    // Ahead and behind is an error: a fast-forward pull cannot land.
     let diverged = cm_core::vcs::VcsSnapshot {
         outcome: cm_core::vcs::VcsOutcome::Ready,
         head: Some("main".into()),
@@ -7411,9 +7416,14 @@ fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
             ..Default::default()
         },
     );
-    d.render();
-    assert_eq!(value_style(&d, "Behind").fg, Some(ui.error_fg));
-    assert_eq!(value_style(&d, "Ahead").fg, Some(ui.error_fg));
+    let out = d.render();
+    assert!(out.contains("↑2 ↓4"), "{out}");
+    assert_eq!(value_style(&d, "Sync").fg, Some(ui.error_fg));
+    // The down arrow is its own span, past `↑2 `.
+    let buf = d.terminal.backend().buffer();
+    let (x, y) = find_cell(buf, "Sync").expect("sync row");
+    assert_eq!(buf[(x + 9 + 3, y)].symbol(), "↓");
+    assert_eq!(buf[(x + 9 + 3, y)].style().fg, Some(ui.error_fg));
 
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('v'));
@@ -7421,6 +7431,36 @@ fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
     let confirm = d.app.pending_confirm.expect("push asks first");
     assert!(confirm.prompt.contains("origin/main"), "{}", confirm.prompt);
     assert!(matches!(confirm.action, Action::VcsRun { push: true, .. }));
+    // Drop the confirm so the next render is the detail panel again.
+    d.app.pending_confirm = None;
+    d.app.input_mode = InputMode::Normal;
+
+    let rebasing = cm_core::vcs::VcsSnapshot {
+        outcome: cm_core::vcs::VcsOutcome::Ready,
+        head: Some("main".into()),
+        upstream: Some("origin/main".into()),
+        dirty: true,
+        operation: Some("rebase".into()),
+        ..Default::default()
+    };
+    d.app.vcs.insert(
+        (
+            d.app.sessions[0].host.clone(),
+            d.app.sessions[0].cwd.clone(),
+        ),
+        super::VcsSlot {
+            view: super::VcsView::Snapshot(rebasing),
+            ..Default::default()
+        },
+    );
+    let out = d.render();
+    assert!(out.contains("dirty, rebase"), "{out}");
+    assert!(!out.contains("Operation"), "{out}");
+    assert_eq!(value_style(&d, "Tree").fg, Some(ui.error_fg));
+    assert!(
+        out.contains('✓'),
+        "nothing to push or pull is a check: {out}"
+    );
 }
 
 #[test]

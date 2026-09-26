@@ -317,7 +317,7 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
-The **Detail** panel shows the full session ID and its copy shortcut, and the selected checkout: branch, upstream, how far ahead or behind, and whether the tree is dirty. That read runs off the UI thread; the panel shows a spinner until it arrives, and marks a checkout that is behind its remote. `Space t s` opens the rest of the record — pid, terminfo, context, when the session last updated, and the first prompt. Troubled
+The **Detail** panel shows the full session ID and its copy shortcut, and the selected checkout: branch, upstream, how far ahead (`↑`) or behind (`↓`), and the working tree (clean, dirty, or mid-operation). That read runs off the UI thread; the panel shows a spinner until it arrives, and marks a checkout that is behind its remote. `Space t s` opens the rest of the record — pid, terminfo, context, when the session last updated, and the first prompt. Troubled
 sessions show connection or cleanup information with available recovery keys;
 narrow layouts prioritize those hints. For Codex app-server sessions, a forced
 removal reports whether the thread was missing or the server was unreachable,
