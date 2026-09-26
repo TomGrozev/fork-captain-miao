@@ -114,7 +114,7 @@ impl TestDashboard {
         self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
-    /// `Space t <key>`: every toggle lives under that prefix.
+    /// `Space t <key>`: preview, detail, the session record, and keep-awake.
     fn press_toggle(&mut self, key: char) -> Option<Action> {
         self.press(KeyCode::Char(' '));
         self.press(KeyCode::Char('t'));
@@ -3713,7 +3713,7 @@ fn marking_needs_input_keeps_cursor_on_the_session() {
     // Select the 2nd session and mark it needs-input.
     d.press(KeyCode::Char('j'));
     assert_eq!(d.app.selected_pid(), Some(2));
-    d.press_toggle('i');
+    d.press(KeyCode::Char('i'));
 
     // End state is needs-attention: pid 2 floats up to the attention tier and the
     // cursor rides up with it, so the user stays on the session they just flagged.
@@ -3738,13 +3738,13 @@ fn clearing_needs_input_advances_cursor_to_next_session() {
 
     // Flag pid 2; it floats to the top attention tier and the cursor follows.
     d.press(KeyCode::Char('j'));
-    d.press_toggle('i');
+    d.press(KeyCode::Char('i'));
     assert_eq!(d.app.selected_pid(), Some(2));
     // Order is now [2, 1, 3, 4]; pid 1 sits just below the flagged row.
 
     // Clearing needs-input (end state not attention) drops pid 2 back to idle.
     // The cursor doesn't follow it down — it lands on what was the *next* row.
-    d.press_toggle('i');
+    d.press(KeyCode::Char('i'));
     assert!(!d.app.is_follow_up(&(crate::state::HostId::local(), 2)));
     assert_eq!(d.app.selected_pid(), Some(1));
 }
@@ -3769,7 +3769,7 @@ fn clearing_needs_input_on_last_row_moves_to_previous() {
     assert_eq!(d.app.selected_pid(), Some(2));
 
     // Clear it: no session below, so the cursor falls back to the previous one.
-    d.press_toggle('i');
+    d.press(KeyCode::Char('i'));
     assert!(!d.app.is_follow_up(&(crate::state::HostId::local(), 2)));
     assert_eq!(d.app.selected_pid(), Some(1));
 }
@@ -5407,11 +5407,22 @@ fn narrow_layout_stacks_panels_and_trims_columns() {
         !out.contains("Ctx"),
         "narrow layout drops the context column"
     );
-    // The compact detail panel shows exactly agent / model / context / updated.
+    // The compact detail panel shows agent / model and the checkout, not the
+    // record fields. Those open with `Space t s`.
     assert!(out.contains("Agent"), "detail keeps the Agent field");
     assert!(out.contains("Model"), "detail keeps the Model field");
-    assert!(out.contains("Context"), "detail keeps the Context field");
-    // The wide detail's extra fields are gone.
+    assert!(
+        out.contains("reading"),
+        "the checkout shows a spinner: {out}"
+    );
+    assert!(
+        !out.contains("Context"),
+        "context moved to the session record"
+    );
+    assert!(
+        !out.contains("Updated"),
+        "updated moved to the session record"
+    );
     assert!(
         !out.contains("First prompt"),
         "compact detail drops first-prompt"
@@ -5448,17 +5459,26 @@ fn a_backend_that_reports_no_context_total_says_so_instead_of_pending() {
         "a backend with no context total to give must not read as pending: {reasonix}"
     );
 
-    // The narrow layout drops that column and shows a `Context` line instead,
-    // which needs the same distinction: an em dash pends, `n/a` doesn't.
-    let claude_narrow = render(crate::agent::AgentControl::Claude, 60);
+    // The narrow layout drops that column. The same distinction lives in the
+    // session record: an em dash pends, `n/a` doesn't.
+    let record = |agent: crate::agent::AgentControl| {
+        let mut d = TestDashboard::new(80, 24);
+        let mut s = session(1, "/home/test/proj", SessionStatus::Active);
+        s.agent = agent;
+        s.context_tokens = None;
+        d.set_sessions(vec![s]);
+        d.press_toggle('s');
+        d.render()
+    };
+    let claude_record = record(crate::agent::AgentControl::Claude);
     assert!(
-        claude_narrow.contains("Context") && !claude_narrow.contains("n/a"),
-        "the compact detail pends with an em dash: {claude_narrow}"
+        claude_record.contains("Context") && !claude_record.contains("n/a"),
+        "the session record pends with an em dash: {claude_record}"
     );
-    let reasonix_narrow = render(crate::agent::AgentControl::Reasonix, 60);
+    let reasonix_record = record(crate::agent::AgentControl::Reasonix);
     assert!(
-        reasonix_narrow.contains("Context") && reasonix_narrow.contains("n/a"),
-        "…and says so when nothing is coming: {reasonix_narrow}"
+        reasonix_record.contains("Context") && reasonix_record.contains("n/a"),
+        "…and says so when nothing is coming: {reasonix_record}"
     );
 }
 
@@ -5475,8 +5495,8 @@ fn a_known_context_window_stays_an_absolute_count_in_the_table() {
         s
     };
 
-    // Tall enough that the wide detail's Context line (below Terminfo) is on
-    // screen; 20 rows clips it.
+    // The table stays the used count. The window is in the session record,
+    // not the side panel.
     let mut wide = TestDashboard::new(160, 40);
     wide.set_sessions(vec![grok()]);
     let out = wide.render();
@@ -5489,20 +5509,27 @@ fn a_known_context_window_stays_an_absolute_count_in_the_table() {
         "the table cell is the used count, same as Claude: {out}"
     );
     assert!(
-        out.contains("350k/500k"),
-        "the detail panel shows used over the window: {out}"
+        !out.contains("350k/500k"),
+        "the side panel does not carry the window: {out}"
+    );
+    wide.press_toggle('s');
+    let record = wide.render();
+    assert!(
+        record.contains("350k/500k"),
+        "the session record shows used over the window: {record}"
     );
 
-    let mut narrow = TestDashboard::new(60, 30);
+    let mut narrow = TestDashboard::new(80, 24);
     narrow.set_sessions(vec![grok()]);
+    narrow.press_toggle('s');
     let narrow_out = narrow.render();
     assert!(
         narrow_out.contains("350k/500k"),
-        "the compact detail keeps used/window: {narrow_out}"
+        "the session record keeps used/window: {narrow_out}"
     );
     assert!(
         !narrow_out.contains("70%"),
-        "nor does the compact detail fall back to a percentage: {narrow_out}"
+        "nor does the record fall back to a percentage: {narrow_out}"
     );
 }
 
@@ -5524,13 +5551,17 @@ fn wide_layout_keeps_full_columns_and_detail() {
         out.contains("Last prompt"),
         "wide table keeps the last-prompt column"
     );
-    assert!(out.contains("PID"), "wide detail keeps the full field set");
+    assert!(
+        !out.contains("PID"),
+        "pid moved out of the side panel: {out}"
+    );
+    assert!(out.contains("Detail"), "the side panel is still there");
 }
 
 /// A pooled session's `TERM` is whatever the client that *created* the pty
 /// sent, frozen there for the session's whole life — so a row can be rendering
 /// against a terminfo that has nothing to do with the window you are looking at
-/// it through, and nothing said so. The detail panel says so. A value matching
+/// it through, and nothing said so. The session record says so. A value matching
 /// this dashboard's own terminfo has nothing to report and draws dim.
 /// A worktree row's cwd ends in `.claude/worktrees/<name>`, the one thing
 /// telling it apart from its repo and the last thing the eye reaches in a
@@ -5587,6 +5618,7 @@ fn the_detail_panel_names_the_terminfo_a_session_renders_against() {
     let mut d = TestDashboard::new(160, 20);
     d.app.panels_initialized = true;
     d.app.detail_visible = true;
+    d.app.session_detail = true;
     d.app.terminfo = Some("xterm-kitty".into());
 
     let mut pooled = session(1, "/srv/away", SessionStatus::Idle);
@@ -5777,8 +5809,7 @@ fn a_foreign_terminfo_warns_and_names_this_terminal() {
     let mut d = TestDashboard::new(160, 20);
     d.app.panels_initialized = true;
     d.app.detail_visible = true;
-    // The warning is a continuation line under the value, so the panel needs
-    // its full height — with the preview on, the box ends at `Terminfo`.
+    d.app.session_detail = true;
     d.app.preview_visible = false;
     d.app.terminfo = Some("xterm-kitty".into());
 
@@ -7275,19 +7306,36 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 #[test]
-fn space_v_s_opens_the_version_control_panel() {
-    let mut d = TestDashboard::new(120, 24);
+fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
+    use ratatui::style::Modifier;
+    let mut d = TestDashboard::new(160, 40);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    d.app.preview_visible = false;
     d.set_sessions(vec![session(1, "/home/test/a", SessionStatus::Idle)]);
+
+    // `s` is not a version-control key. The old status window is gone.
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('v'));
     d.press(KeyCode::Char('s'));
-    assert!(d.app.vcs_panel);
+    assert!(!d.app.session_detail);
+    assert!(d.app.pending_prefix.is_empty());
+
+    let out = d.render();
+    assert!(
+        out.contains("reading"),
+        "a spinner until the read lands: {out}"
+    );
+    assert!(d.app.vcs_spinner_phase().is_some());
+
     let snap = cm_core::vcs::VcsSnapshot {
         outcome: cm_core::vcs::VcsOutcome::Ready,
         system: Some("git".into()),
         head: Some("main".into()),
         upstream: Some("origin/main".into()),
         ahead: 2,
+        behind: 0,
+        dirty: false,
         ..Default::default()
     };
     d.app.vcs.insert(
@@ -7300,10 +7348,126 @@ fn space_v_s_opens_the_version_control_panel() {
             ..Default::default()
         },
     );
+    assert!(d.app.vcs_spinner_phase().is_none());
+    let out = d.render();
+    assert!(out.contains("main"), "{out}");
+    assert!(out.contains("origin/main"), "{out}");
+    assert!(!out.contains("Version control"), "no status window: {out}");
+    let ui = crate::config::get().colors.ui.clone();
+    let value_style = |d: &TestDashboard, label: &str| {
+        let buf = d.terminal.backend().buffer();
+        let (x, y) = find_cell(buf, label).unwrap_or_else(|| panic!("{label} not drawn"));
+        buf[(x + 9, y)].style()
+    };
+    // Ahead of the remote, and not behind it: information, not a warning.
+    assert_eq!(value_style(&d, "Ahead").fg, Some(ui.header_fg));
+    assert!(
+        value_style(&d, "Behind")
+            .add_modifier
+            .contains(Modifier::DIM)
+    );
+
+    // Behind the remote needs attention. Ahead and behind is an error: a
+    // fast-forward pull cannot land.
+    let behind = cm_core::vcs::VcsSnapshot {
+        outcome: cm_core::vcs::VcsOutcome::Ready,
+        system: Some("git".into()),
+        head: Some("main".into()),
+        upstream: Some("origin/main".into()),
+        ahead: 0,
+        behind: 4,
+        dirty: true,
+        ..Default::default()
+    };
+    d.app.vcs.insert(
+        (
+            d.app.sessions[0].host.clone(),
+            d.app.sessions[0].cwd.clone(),
+        ),
+        super::VcsSlot {
+            view: super::VcsView::Snapshot(behind),
+            ..Default::default()
+        },
+    );
+    d.render();
+    assert_eq!(value_style(&d, "Behind").fg, Some(ui.attention_fg));
+    assert_eq!(value_style(&d, "Tree").fg, Some(ui.attention_fg));
+
+    let diverged = cm_core::vcs::VcsSnapshot {
+        outcome: cm_core::vcs::VcsOutcome::Ready,
+        head: Some("main".into()),
+        upstream: Some("origin/main".into()),
+        ahead: 2,
+        behind: 4,
+        ..Default::default()
+    };
+    d.app.vcs.insert(
+        (
+            d.app.sessions[0].host.clone(),
+            d.app.sessions[0].cwd.clone(),
+        ),
+        super::VcsSlot {
+            view: super::VcsView::Snapshot(diverged),
+            ..Default::default()
+        },
+    );
+    d.render();
+    assert_eq!(value_style(&d, "Behind").fg, Some(ui.error_fg));
+    assert_eq!(value_style(&d, "Ahead").fg, Some(ui.error_fg));
+
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('v'));
     d.press(KeyCode::Char('p'));
     let confirm = d.app.pending_confirm.expect("push asks first");
     assert!(confirm.prompt.contains("origin/main"), "{}", confirm.prompt);
     assert!(matches!(confirm.action, Action::VcsRun { push: true, .. }));
+}
+
+#[test]
+fn space_t_s_opens_the_session_record() {
+    let mut d = TestDashboard::new(160, 30);
+    d.app.panels_initialized = true;
+    d.app.preview_visible = false;
+    let mut s = session(1, "/home/test/proj", SessionStatus::Idle);
+    s.name = Some("named".into());
+    s.child_pid = Some(4242);
+    s.context_tokens = Some(1000);
+    s.first_prompt = Some("open the gate".into());
+    s.terminfo = Some("xterm-256color".into());
+    d.app.terminfo = Some("xterm-kitty".into());
+    d.set_sessions(vec![s]);
+
+    let side = d.render();
+    assert!(!side.contains("PID"), "{side}");
+    assert!(!side.contains("Terminfo"), "{side}");
+    assert!(!side.contains("First prompt"), "{side}");
+    assert!(!side.contains("open the gate"), "{side}");
+
+    d.press_toggle('s');
+    assert!(d.app.session_detail);
+    let out = d.render();
+    assert!(out.contains("PID"), "{out}");
+    assert!(out.contains("4242"), "{out}");
+    assert!(out.contains("Terminfo"), "{out}");
+    assert!(out.contains("xterm-256color"), "{out}");
+    assert!(out.contains("not yours (xterm-kitty)"), "{out}");
+    assert!(out.contains("Context"), "{out}");
+    assert!(out.contains("Updated"), "{out}");
+    assert!(out.contains("First prompt"), "{out}");
+    assert!(out.contains("open the gate"), "{out}");
+
+    d.press(KeyCode::Char('j'));
+    assert_eq!(d.app.session_detail_scroll, 1);
+    d.render();
+    assert_eq!(
+        d.app.session_detail_scroll, 0,
+        "scroll clamps when the record fits"
+    );
+
+    // `q` closes the record. It must not quit the dashboard.
+    d.press(KeyCode::Char('q'));
+    assert!(!d.app.session_detail);
+    assert!(!d.app.should_quit);
 }
 
 #[test]

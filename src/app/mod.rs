@@ -815,7 +815,7 @@ pub(super) struct VcsSlot {
     pub(super) inflight: bool,
 }
 
-/// What the detail line and the version-control panel draw.
+/// What the detail panel draws for one checkout.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) enum VcsView {
     #[default]
@@ -1129,8 +1129,9 @@ pub(super) struct App {
     /// User toggle for the preview panel. Manual toggle always wins — the
     /// panel renders iff this flag is true.
     pub(super) preview_visible: bool,
-    /// Version-control panel for the selected session. `Space v s`.
-    pub(super) vcs_panel: bool,
+    /// Full session record, opened with `Space t s`. The side panel stays the glance.
+    pub(super) session_detail: bool,
+    pub(super) session_detail_scroll: usize,
     /// Last status per `(host, cwd)`. The UI thread only reads this; probes
     /// land through the event loop.
     pub(super) vcs: HashMap<(HostId, String), VcsSlot>,
@@ -1687,7 +1688,8 @@ impl App {
             preview_height: 0,
             narrow_layout: false,
             preview_visible: true,
-            vcs_panel: false,
+            session_detail: false,
+            session_detail_scroll: 0,
             vcs: HashMap::new(),
             detail_visible: true,
             panels_initialized: false,

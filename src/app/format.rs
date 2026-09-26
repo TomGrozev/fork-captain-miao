@@ -869,9 +869,9 @@ pub(super) fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Detail-panel Context line: `351k/500k` when the window is known. The table
+/// Session-record Context line: `351k/500k` when the window is known. The table
 /// cell is always the used-token count (`format_tokens`) so a Grok row is
-/// comparable to Claude's; the window belongs here, where there is room.
+/// comparable to Claude's; the window belongs in the record, where there is room.
 pub(super) fn format_context_detail(tokens: u64, window: Option<u64>) -> String {
     match window.filter(|&w| w > 0) {
         Some(w) => format!("{}/{}", format_tokens(tokens), format_tokens(w)),

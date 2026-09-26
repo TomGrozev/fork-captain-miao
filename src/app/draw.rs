@@ -111,8 +111,8 @@ impl App {
         if self.input_mode == InputMode::HostEdit {
             self.draw_host_edit(frame, frame.area());
         }
-        if self.vcs_panel && self.input_mode == InputMode::Normal {
-            self.draw_vcs_panel(frame, frame.area());
+        if self.session_detail && self.input_mode == InputMode::Normal {
+            self.draw_session_detail(frame, frame.area());
         }
         if self.input_mode == InputMode::Messages {
             self.draw_message_log(frame, frame.area());
@@ -238,29 +238,29 @@ impl App {
     }
 
     /// The narrow layout: session list, detail, and preview stacked vertically.
-    /// The detail panel is a fixed, compact height; the preview takes whatever's
+    /// The detail panel is as tall as its fields. The preview takes whatever is
     /// left and is dropped entirely when the viewport is too short to spare it.
     fn draw_narrow_body(&mut self, frame: &mut ratatui::Frame, body: Rect) {
-        // Healthy compact detail: border (2 rows) + four fields. Failures may
-        // use additional rows while leaving room for the session list.
-        const DETAIL_H: u16 = 6;
         // Keep the session list usable before spending rows on the preview.
         const TABLE_MIN: u16 = 6;
         // Preview chrome (top/bottom border + vertical padding = 4) + 2 content rows.
         const PREVIEW_MIN: u16 = 6;
+        // The border around the compact detail.
+        const DETAIL_CHROME: u16 = 2;
 
         let detail_h = if self.detail_visible {
-            let troubled = self.selected_session_ref().is_some_and(|s| {
-                s.codex_connected == Some(false)
-                    || s.cleanup.is_some()
-                    || s.status == SessionStatus::FailedToStart
-            });
-            let wanted = if troubled {
-                10.min(body.height.saturating_sub(TABLE_MIN)).max(DETAIL_H)
+            // Agent, model, the checkout, and any recovery lines. A short
+            // viewport clips this from the bottom, so the diagnosis stays and
+            // the checkout is what gets cut. The table keeps TABLE_MIN when
+            // the body can spare it.
+            let content = self.narrow_detail_lines().len() as u16;
+            let wanted = content.saturating_add(DETAIL_CHROME);
+            let room = body.height.saturating_sub(TABLE_MIN);
+            if room == 0 {
+                wanted.min(body.height)
             } else {
-                DETAIL_H
-            };
-            wanted.min(body.height)
+                wanted.min(room).min(body.height)
+            }
         } else {
             0
         };
@@ -315,91 +315,53 @@ impl App {
     // Overlays: directory marks, hosts, confirm
     // =============================================================================
 
-    fn vcs_detail_line(&self, host: &crate::state::HostId, cwd: &str) -> Line<'static> {
+    fn vcs_detail_lines(&self, host: &crate::state::HostId, cwd: &str) -> Vec<Line<'static>> {
         let ui = &config::get().colors.ui;
+        let dim = Style::default().add_modifier(Modifier::DIM);
         let view = self
             .vcs
             .get(&(host.clone(), cwd.to_string()))
             .map(|slot| &slot.view);
-        let (text, style) = match view {
+        match view {
             Some(super::VcsView::Snapshot(snap))
                 if snap.outcome == cm_core::vcs::VcsOutcome::Ready =>
             {
-                (vcs_ready_text(snap), vcs_ready_style(snap, ui))
+                vcs_ready_lines(snap, ui)
             }
             Some(super::VcsView::Snapshot(snap)) => {
-                (vcs_outcome_label(snap), Style::default().fg(ui.error_fg))
-            }
-            Some(super::VcsView::Unavailable) => (
-                "n/a".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-            _ => (
-                "…".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        };
-        Line::from(vec![
-            Span::styled(
-                format!("{:<9}", "Head"),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-            Span::styled(text, style),
-        ])
-    }
-
-    fn draw_vcs_panel(&self, frame: &mut ratatui::Frame, area: Rect) {
-        let Some(session) = self.selected_session_ref() else {
-            return;
-        };
-        let popup = centered_rect(56, 40, area);
-        clear_overlay(frame, popup);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(" Version control ", Style::default().bold()));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        let view = self
-            .vcs
-            .get(&(session.host.clone(), session.cwd.clone()))
-            .map(|slot| &slot.view);
-        let lines = match view {
-            Some(super::VcsView::Snapshot(snap))
-                if snap.outcome == cm_core::vcs::VcsOutcome::Ready =>
-            {
-                let mut lines = vec![
-                    vcs_row("Branch", snap.head.as_deref().unwrap_or("detached")),
-                    vcs_row("Upstream", snap.upstream.as_deref().unwrap_or("none")),
-                    vcs_row("Ahead", &snap.ahead.to_string()),
-                    vcs_row("Behind", &snap.behind.to_string()),
-                ];
-                if let Some(operation) = &snap.operation {
-                    lines.push(vcs_row("Operation", operation));
-                }
-                if let Some(workspace) = &snap.workspace {
-                    lines.push(vcs_row("Worktree", workspace));
-                }
-                lines.push(vcs_row(
-                    "Tree",
-                    if snap.conflicts {
-                        "conflicts"
-                    } else if snap.dirty {
-                        "dirty"
-                    } else {
-                        "clean"
-                    },
-                ));
-                lines
-            }
-            Some(super::VcsView::Snapshot(snap)) => vec![Line::from(vcs_outcome_label(snap))],
-            Some(super::VcsView::Unavailable) => {
-                vec![Line::from(
-                    "n/a — this host's server does not report version control",
+                vec![vcs_field(
+                    "Vcs",
+                    &vcs_outcome_label(snap),
+                    vcs_outcome_style(snap, ui),
                 )]
             }
-            _ => vec![Line::from("…")],
+            Some(super::VcsView::Unavailable) => vec![vcs_field("Vcs", "n/a", dim)],
+            _ => vec![vcs_field(
+                "Vcs",
+                &format!("{} reading…", vitals_spinner_glyph()),
+                dim,
+            )],
+        }
+    }
+
+    /// True while the selected row's version-control line is still a spinner.
+    /// The run loop redraws on each frame of that spinner and otherwise not.
+    pub(super) fn vcs_spinner_phase(&self) -> Option<usize> {
+        if !self.detail_visible {
+            return None;
+        }
+        let session = self.selected_session_ref()?;
+        let loading = match self.vcs.get(&(session.host.clone(), session.cwd.clone())) {
+            Some(slot) => matches!(slot.view, super::VcsView::Loading),
+            None => true,
         };
-        frame.render_widget(Paragraph::new(lines), inner);
+        if !loading {
+            return None;
+        }
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Some(vitals_spinner_frame(since_epoch))
     }
 
     fn draw_confirm(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -644,16 +606,15 @@ impl App {
             return;
         };
 
-        let ctx_tokens = s.context_tokens;
-        // `—` means "no number yet" — the first turn hasn't landed. A backend
-        // that will never have one (`AgentCapabilities::context_tokens`:
-        // Reasonix) says so instead, so the field stops reading as a session
-        // that stalled before its first reply.
-        let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
-            (Some(t), _) => format_context_detail(t, s.context_window),
-            (None, true) => "—".to_string(),
-            (None, false) => "n/a".to_string(),
-        };
+        // The narrow stack drops the table's context and updated columns, so
+        // agent and model stay here, then the checkout. Recovery lines are
+        // drawn above the checkout: a short viewport clips from the bottom.
+        if narrow {
+            let lines = self.narrow_detail_lines();
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+            return;
+        }
+
         let model = s
             .model
             .as_deref()
@@ -664,10 +625,6 @@ impl App {
             .as_deref()
             .map(|id| Style::default().fg(model_color(id)))
             .unwrap_or_default();
-        let ctx_style = ctx_tokens
-            .map(|t| context_pressure_style(t, s.context_window))
-            .unwrap_or_default();
-        let elapsed = format_elapsed(LauncherState::now().saturating_sub(s.updated_at));
         let diagnostics = super::diagnostics::session_diagnostics(
             s,
             self.backend_for(&s.host)
@@ -700,23 +657,6 @@ impl App {
             )
         };
 
-        // A healthy narrow panel shows fields omitted from its table. Recovery
-        // information takes priority when either the host or session fails.
-        if narrow {
-            let mut lines = vec![
-                Line::from(vec![label("Agent"), Span::raw(s.agent_label())]),
-                Line::from(vec![label("Model"), Span::styled(model, model_style)]),
-                Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
-                Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
-            ];
-            if diagnostics.iter().any(|d| d.attention) {
-                lines.truncate(1);
-                lines.extend(diagnostic_lines());
-            }
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-            return;
-        }
-
         let name = session_display_name(s, self.index_of(s), &self.random_names);
         let status_text = match (&s.status, &s.last_tool) {
             (SessionStatus::Active, Some(tool)) => format!("{} ({tool})", s.status_label()),
@@ -743,85 +683,11 @@ impl App {
         let worktree = split_worktree(&s.cwd)
             .1
             .map(|name| Line::from(vec![label("Worktree"), Span::raw(name.to_string())]));
-        let child = s
-            .child_pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "—".to_string());
-        // Resolve through the binding so the detail panel shows the real local
-        // window even when the launcher self-reports none (dashboard-spawned /
-        // remote-attached sessions, §6). A foreign-terminal row has no window
-        // here — surface where it does live instead.
-        let window = if let Some(identity) = self.foreign_terminal(s) {
-            format!("in {identity}")
-        } else if let Some(w) = self.window_id_for_session(s) {
-            w.to_string()
-        } else if self.detached_kind(s) == Some(super::format::Detached::HeldElsewhere) {
-            // No window *here*, but the host says the pty has a client — say so
-            // rather than the bare `—` a free detached row gets, which reads as
-            // "nowhere" and is exactly the case this isn't.
-            "elsewhere".to_string()
-        } else {
-            "—".to_string()
-        };
-        let tab = s
-            .tab_id
-            .as_ref()
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "—".to_string());
-        // The terminfo the session renders against. Interesting mostly for a
-        // *pooled* row, where libshpool froze it at the first attach and every
-        // window since has inherited it — so a session opened from Kitty onto a
-        // host without kitty's terminfo has been `xterm-256color` all along,
-        // and this is the only place that says so.
-        //
-        // Matching this dashboard's own `TERM` says nothing, so it draws dim
-        // (the same "this is background" device the detached tier uses) and a
-        // value that differs is what stays bright. No badge, no colour: a
-        // mismatch is usually benign, and yellow would cry wolf on every remote
-        // row.
-        let terminfo = match s.terminfo.as_deref() {
-            Some(t) if Some(t) == self.terminfo.as_deref() => {
-                Span::styled(t.to_string(), Style::default().add_modifier(Modifier::DIM))
-            }
-            Some(t) => Span::raw(t.to_string()),
-            None => Span::raw("—"),
-        };
-        // …and when it isn't ours, a second line naming what this terminal is,
-        // in the attention colour. The bright value above says *that* they
-        // differ; this says what to do about it, because the remedy is the
-        // same whichever way the difference arose — the host lacking our
-        // terminfo, or another emulator having created the session: install
-        // this name there (`infocmp -x <name> | ssh <host> tic -x -`) and the
-        // sessions this terminal opens keep it.
-        //
-        // Derived rather than reported: the host *could* tell us it had to
-        // substitute, but only through a wire field carrying a value that is
-        // this one in every case worth acting on, so the comparison earns its
-        // keep and the field doesn't.
-        let terminfo_mismatch = self
-            .terminfo
-            .as_deref()
-            .filter(|ours| s.terminfo.is_some() && s.terminfo.as_deref() != Some(*ours))
-            .map(|ours| {
-                Line::from(vec![
-                    label(""),
-                    Span::styled(
-                        format!("not yours ({ours})"),
-                        Style::default().fg(ui.attention_fg),
-                    ),
-                ])
-            });
         let prompt = s
             .last_prompt
             .as_deref()
             .map(last_prompt_text)
             .unwrap_or("—");
-        // Truncate the first prompt to a single line so a long opener doesn't
-        // wrap into a wall of text above the last prompt.
-        let first_prompt = truncate_str(
-            s.first_prompt.as_deref().unwrap_or("—"),
-            inner.width as usize,
-        );
 
         let name_style = Style::default().add_modifier(Modifier::BOLD);
         let mut lines: Vec<Line> = vec![
@@ -835,21 +701,9 @@ impl App {
             Line::from(vec![label("Session"), Span::raw(sid)]),
         ];
         lines.extend(diagnostic_lines());
-        lines.extend([
-            Line::from(vec![
-                label("PID"),
-                Span::raw(format!("{child} (win {window}, tab {tab})")),
-            ]),
-            Line::from(vec![label("Terminfo"), terminfo]),
-        ]);
-        lines.extend(terminfo_mismatch);
-        lines.extend([
-            Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
-            Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
-            Line::from(vec![label("Dir"), Span::raw(cwd)]),
-        ]);
+        lines.push(Line::from(vec![label("Dir"), Span::raw(cwd)]));
         lines.extend(worktree);
-        lines.push(self.vcs_detail_line(&s.host, &s.cwd));
+        lines.extend(self.vcs_detail_lines(&s.host, &s.cwd));
 
         if let Some(err) = &s.last_error
             && !matches!(&s.cleanup, Some(crate::state::CleanupStatus::Failed { message }) if message == err)
@@ -867,19 +721,195 @@ impl App {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "First prompt",
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-        lines.push(Line::from(first_prompt));
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
             "Last prompt",
             Style::default().add_modifier(Modifier::DIM),
         )));
         lines.push(Line::from(prompt.to_string()));
 
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    }
+
+    /// Compact detail for the vertical stack: agent, model, then the checkout.
+    /// Attention diagnostics sit above the checkout so a short viewport clips
+    /// the checkout rather than the recovery hint.
+    fn narrow_detail_lines(&self) -> Vec<Line<'static>> {
+        let Some(s) = self.selected_session_ref() else {
+            return vec![Line::from(Span::styled(
+                "(no session selected)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))];
+        };
+        let label = |k: &'static str| {
+            Span::styled(
+                format!("{k:<9}"),
+                Style::default().add_modifier(Modifier::DIM),
+            )
+        };
+        let model = s
+            .model
+            .as_deref()
+            .map(model_label)
+            .unwrap_or_else(|| "—".to_string());
+        let model_style = s
+            .model
+            .as_deref()
+            .map(|id| Style::default().fg(model_color(id)))
+            .unwrap_or_default();
+        let mut lines = vec![
+            Line::from(vec![label("Agent"), Span::raw(s.agent_label())]),
+            Line::from(vec![label("Model"), Span::styled(model, model_style)]),
+        ];
+        let diagnostics = super::diagnostics::session_diagnostics(
+            s,
+            self.backend_for(&s.host)
+                .map_or(crate::backend::ConnState::Disconnected, |b| b.conn_state()),
+            &self.keymap,
+        );
+        if diagnostics.iter().any(|d| d.attention) {
+            let ui = &config::get().colors.ui;
+            lines.extend(diagnostics.iter().map(|d| {
+                Line::from(vec![
+                    Span::styled(format!("{:<9}", d.label), Style::default().dim()),
+                    Span::styled(
+                        d.message.clone(),
+                        if d.attention {
+                            Style::default().fg(ui.attention_fg)
+                        } else {
+                            Style::default().dim()
+                        },
+                    ),
+                ])
+            }));
+        }
+        lines.extend(self.vcs_detail_lines(&s.host, &s.cwd));
+        lines
+    }
+
+    /// Pid, terminfo, context, updated, and the first prompt. These left the
+    /// side panel; `Space t s` opens them here.
+    fn session_record_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(s) = self.selected_session_ref() else {
+            return vec![Line::from(Span::styled(
+                "(no session selected)",
+                Style::default().add_modifier(Modifier::DIM),
+            ))];
+        };
+        let ui = &config::get().colors.ui;
+        let label = |k: &'static str| {
+            Span::styled(
+                format!("{k:<9}"),
+                Style::default().add_modifier(Modifier::DIM),
+            )
+        };
+        let child = s
+            .child_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        // Resolve through the binding so this shows the real local window even
+        // when the launcher self-reports none (dashboard-spawned /
+        // remote-attached sessions). A foreign-terminal row has no window here.
+        let window = if let Some(identity) = self.foreign_terminal(s) {
+            format!("in {identity}")
+        } else if let Some(w) = self.window_id_for_session(s) {
+            w.to_string()
+        } else if self.detached_kind(s) == Some(super::format::Detached::HeldElsewhere) {
+            // No window here, but the host says the pty has a client. A bare
+            // `—` would read as "nowhere", which is the case this isn't.
+            "elsewhere".to_string()
+        } else {
+            "—".to_string()
+        };
+        let tab = s
+            .tab_id
+            .as_ref()
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "—".to_string());
+        // The terminfo the session renders against. Interesting mostly for a
+        // pooled row, where the pool froze it at the first attach. Matching
+        // this dashboard's own `TERM` says nothing, so it draws dim; a value
+        // that differs stays bright. No yellow: a mismatch is usually benign.
+        let terminfo = match s.terminfo.as_deref() {
+            Some(t) if Some(t) == self.terminfo.as_deref() => {
+                Span::styled(t.to_string(), Style::default().add_modifier(Modifier::DIM))
+            }
+            Some(t) => Span::raw(t.to_string()),
+            None => Span::raw("—"),
+        };
+        // When it isn't ours, name what this terminal is. That is the name to
+        // install on the host, whichever way the difference arose.
+        let terminfo_mismatch = self
+            .terminfo
+            .as_deref()
+            .filter(|ours| s.terminfo.is_some() && s.terminfo.as_deref() != Some(*ours))
+            .map(|ours| {
+                Line::from(vec![
+                    label(""),
+                    Span::styled(
+                        format!("not yours ({ours})"),
+                        Style::default().fg(ui.attention_fg),
+                    ),
+                ])
+            });
+        // `—` means no number yet. A backend that will never have one says
+        // `n/a`, so the field doesn't read as a session stalled before its
+        // first reply.
+        let ctx_tokens = s.context_tokens;
+        let ctx = match (ctx_tokens, s.agent.capabilities().context_tokens) {
+            (Some(t), _) => format_context_detail(t, s.context_window),
+            (None, true) => "—".to_string(),
+            (None, false) => "n/a".to_string(),
+        };
+        let ctx_style = ctx_tokens
+            .map(|t| context_pressure_style(t, s.context_window))
+            .unwrap_or_default();
+        let elapsed = format_elapsed(LauncherState::now().saturating_sub(s.updated_at));
+        // One line. A newline in a span doesn't wrap, it breaks the row, and a
+        // control character would be executed by the terminal.
+        let first = crate::backend::host_text_safe(s.first_prompt.as_deref().unwrap_or("—"));
+        let first_prompt = truncate_str(&first.replace(['\n', '\r'], " "), width.max(1));
+
+        let mut lines = vec![
+            Line::from(vec![
+                label("PID"),
+                Span::raw(format!("{child} (win {window}, tab {tab})")),
+            ]),
+            Line::from(vec![label("Terminfo"), terminfo]),
+        ];
+        lines.extend(terminfo_mismatch);
+        lines.extend([
+            Line::from(vec![label("Context"), Span::styled(ctx, ctx_style)]),
+            Line::from(vec![label("Updated"), Span::raw(format!("{elapsed} ago"))]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "First prompt",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            Line::from(first_prompt),
+        ]);
+        lines
+    }
+
+    /// The session record. Scroll is clamped here because only a render knows
+    /// how many rows the popup has.
+    fn draw_session_detail(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let popup = centered_rect(64, 60, area);
+        clear_overlay(frame, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(Span::styled(" Session ", Style::default().bold()));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let lines = self.session_record_lines(inner.width as usize);
+        let rows = inner.height as usize;
+        let max_scroll = lines.len().saturating_sub(rows);
+        self.session_detail_scroll = self.session_detail_scroll.min(max_scroll);
+        let visible: Vec<Line> = lines
+            .into_iter()
+            .skip(self.session_detail_scroll)
+            .take(rows)
+            .collect();
+        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), inner);
     }
 
     /// The host half of a row's icon cell, and whether it's a *foreign-terminal*
@@ -1451,16 +1481,18 @@ impl App {
             cmd(Command::ShellTab),
             cmd(Command::JumpAttention),
             Line::from(""),
+            section("Flags"),
+            cmd(Command::TogglePin),
+            cmd(Command::ToggleFollowUp),
+            Line::from(""),
             section("Version control (Space v)"),
-            cmd(Command::VcsPanel),
             cmd(Command::VcsPush),
             cmd(Command::VcsPull),
             Line::from(""),
             section("Toggles (Space t)"),
             cmd(Command::TogglePreview),
             cmd(Command::ToggleDetail),
-            cmd(Command::TogglePin),
-            cmd(Command::ToggleFollowUp),
+            cmd(Command::SessionDetail),
             cmd(Command::ToggleKeepAwake),
             Line::from(""),
             section("Layout (leader: Space)"),
@@ -1587,11 +1619,9 @@ impl App {
         // and every label the other (dim, so it recedes). A pending prefix
         // (Space / g) or the search `/` marker gets a distinct yellow badge pill.
         let spans = match &self.input_mode {
-            InputMode::Normal if self.vcs_panel => {
+            InputMode::Normal if self.session_detail => {
                 let mut spans = Vec::new();
-                spans.extend(hint_pair("p", "push"));
-                spans.extend(hint_pair("l", "pull"));
-                spans.extend(hint_pair("r", "refresh"));
+                spans.extend(hint_pair("j/k", "scroll"));
                 spans.extend(hint_pair("Esc", "close"));
                 spans
             }
@@ -2055,54 +2085,103 @@ pub(super) fn host_tally_spans(
     spans
 }
 
-fn vcs_row(name: &str, value: &str) -> Line<'static> {
+fn vcs_field(name: &str, value: &str, value_style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{name:<10}"),
+            format!("{name:<9}"),
             Style::default().add_modifier(Modifier::DIM),
         ),
-        Span::raw(value.to_string()),
+        Span::styled(value.to_string(), value_style),
     ])
 }
 
-fn vcs_ready_text(snap: &cm_core::vcs::VcsSnapshot) -> String {
-    let mut text = if snap.detached {
-        "detached".to_string()
+/// Branch, upstream, ahead, behind, and the tree. Color is on the value.
+///
+/// Behind the remote needs attention. Ahead of it is information. Both at
+/// once means a fast-forward pull cannot land, so that is an error, as are
+/// conflicts and an operation in progress. Dirty or detached needs attention.
+/// In sync and clean stays dim.
+fn vcs_ready_lines(
+    snap: &cm_core::vcs::VcsSnapshot,
+    ui: &crate::config::UiColors,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let attention = Style::default().fg(ui.attention_fg);
+    let error = Style::default().fg(ui.error_fg);
+    let info = Style::default().fg(ui.header_fg);
+    let diverged = snap.ahead > 0 && snap.behind > 0;
+    let branch = if snap.detached {
+        match snap.head.as_deref() {
+            Some(head) => format!("{head} (detached)"),
+            None => "detached".to_string(),
+        }
     } else {
         snap.head.clone().unwrap_or_else(|| "—".to_string())
     };
-    if let Some(upstream) = &snap.upstream {
-        text.push('…');
-        text.push_str(upstream);
-    }
-    if snap.ahead > 0 && snap.behind > 0 {
-        text.push_str(&format!("  ahead {}, behind {}", snap.ahead, snap.behind));
+    let ahead_style = if diverged {
+        error
     } else if snap.ahead > 0 {
-        text.push_str(&format!("  ahead {}", snap.ahead));
+        info
+    } else {
+        dim
+    };
+    let behind_style = if diverged {
+        error
     } else if snap.behind > 0 {
-        text.push_str(&format!("  behind {}", snap.behind));
-    }
-    if snap.conflicts {
-        text.push_str("  conflicts");
-    } else if snap.dirty {
-        text.push_str("  dirty");
-    }
+        attention
+    } else {
+        dim
+    };
+    let mut lines = vec![
+        vcs_field(
+            "Branch",
+            &branch,
+            if snap.detached {
+                attention
+            } else {
+                Style::default()
+            },
+        ),
+        vcs_field(
+            "Upstream",
+            snap.upstream.as_deref().unwrap_or("none"),
+            if snap.upstream.is_none() {
+                dim
+            } else {
+                Style::default()
+            },
+        ),
+        vcs_field("Ahead", &snap.ahead.to_string(), ahead_style),
+        vcs_field("Behind", &snap.behind.to_string(), behind_style),
+    ];
     if let Some(operation) = &snap.operation {
-        text.push_str("  ");
-        text.push_str(operation);
+        lines.push(vcs_field("Operation", operation, error));
     }
-    text
+    if let Some(workspace) = &snap.workspace {
+        lines.push(vcs_field("Worktree", workspace, Style::default()));
+    }
+    let (tree, tree_style) = if snap.conflicts {
+        ("conflicts", error)
+    } else if snap.dirty {
+        ("dirty", attention)
+    } else {
+        ("clean", dim)
+    };
+    lines.push(vcs_field("Tree", tree, tree_style));
+    lines
 }
 
-fn vcs_ready_style(snap: &cm_core::vcs::VcsSnapshot, ui: &crate::config::UiColors) -> Style {
-    if snap.conflicts || snap.operation.is_some() {
-        Style::default().fg(ui.error_fg)
-    } else if snap.dirty || snap.detached {
-        Style::default().fg(ui.attention_fg)
-    } else if snap.ahead > 0 || snap.behind > 0 {
-        Style::default().fg(ui.header_fg)
-    } else {
-        Style::default().add_modifier(Modifier::DIM)
+fn vcs_outcome_style(snap: &cm_core::vcs::VcsSnapshot, ui: &crate::config::UiColors) -> Style {
+    use cm_core::vcs::VcsOutcome;
+    match snap.outcome {
+        // Not a checkout is the ordinary case. Unsupported and a timeout are
+        // worth a glance; the rest means the read failed.
+        VcsOutcome::NotACheckout => Style::default().add_modifier(Modifier::DIM),
+        VcsOutcome::Unsupported | VcsOutcome::TimedOut => Style::default().fg(ui.attention_fg),
+        VcsOutcome::Ready => Style::default(),
+        VcsOutcome::Missing | VcsOutcome::Denied | VcsOutcome::NoTool | VcsOutcome::Error => {
+            Style::default().fg(ui.error_fg)
+        }
     }
 }
 

@@ -166,7 +166,6 @@ fn detach_prune_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.duration_since(t) >= DETACH_PRUNE_MIN_INTERVAL)
 }
 
-const VCS_PANEL_POLL: Duration = Duration::from_secs(2);
 const VCS_DETAIL_POLL: Duration = Duration::from_secs(15);
 const VCS_RPC_TIMEOUT: Duration = Duration::from_secs(40);
 const VCS_COMMAND_TIMEOUT: Duration = Duration::from_secs(70);
@@ -185,10 +184,10 @@ fn remote_reach(app: &App, host: &HostId) -> RemoteReach {
     }
 }
 
-/// Ask for the selected checkout's status while the detail line or the panel
-/// can show it. Returns immediately; the answer arrives on `tx`.
+/// Ask for the selected checkout's status while the detail panel can show it.
+/// Returns immediately; the answer arrives on `tx`. Git never runs here.
 fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
-    if !app.detail_visible && !app.vcs_panel {
+    if !app.detail_visible {
         return;
     }
     let Some(session) = app.selected_session() else {
@@ -196,11 +195,7 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
     };
     let host = session.host.clone();
     let cwd = session.cwd.clone();
-    let interval = if app.vcs_panel {
-        VCS_PANEL_POLL
-    } else {
-        VCS_DETAIL_POLL
-    };
+    let interval = VCS_DETAIL_POLL;
     {
         let slot = app.vcs.entry((host.clone(), cwd.clone())).or_default();
         if slot.inflight {
@@ -2180,12 +2175,13 @@ async fn refresh_preview(
 /// clock rather than with any state the loop was told about.
 ///
 /// Each is an edge check against the value last drawn, so a steady screen costs
-/// three comparisons and no frame.
+/// a handful of comparisons and no frame.
 fn redraw_reasons(
     app: &App,
     last_age_label: &mut Option<String>,
     last_blink_phase: &mut Option<bool>,
     last_vitals_phase: &mut Option<usize>,
+    last_vcs_phase: &mut Option<usize>,
 ) -> bool {
     let mut redraw = false;
     // Redraw when the preview staleness label changes (at most once a
@@ -2223,6 +2219,15 @@ fn redraw_reasons(
     let vitals_phase = app.vitals_spinner_phase();
     if vitals_phase != *last_vitals_phase {
         *last_vitals_phase = vitals_phase;
+        redraw = true;
+    }
+
+    // The detail panel's checkout spinner, on the same terms: a frame per
+    // phase change while the selected row is still being read, and `None`
+    // once a snapshot is in (or the panel is shut).
+    let vcs_phase = app.vcs_spinner_phase();
+    if vcs_phase != *last_vcs_phase {
+        *last_vcs_phase = vcs_phase;
         redraw = true;
     }
     redraw
@@ -2265,6 +2270,11 @@ fn next_wakeup(
     if let Some(t) = logo_recompose_at {
         poll_timeout = poll_timeout.min(t.saturating_duration_since(Instant::now()));
     }
+    // A checkout spinner advances off the wall clock. Sleeping a long poll
+    // interval would freeze it between frames.
+    if app.vcs_spinner_phase().is_some() {
+        poll_timeout = poll_timeout.min(super::draw::VITALS_SPINNER_STEP);
+    }
     poll_timeout
 }
 
@@ -2297,6 +2307,8 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     let mut last_blink_phase: Option<bool> = None;
     // Ditto for the hosts panel's utilisation spinner.
     let mut last_vitals_phase: Option<usize> = None;
+    // Ditto for the detail panel's checkout spinner.
+    let mut last_vcs_phase: Option<usize> = None;
     // Whether the hosts panel was open on the previous pass, so its *opening*
     // can be acted on (see the utilisation block).
     let mut hosts_panel_open = false;
@@ -2425,6 +2437,7 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
             &mut last_age_label,
             &mut last_blink_phase,
             &mut last_vitals_phase,
+            &mut last_vcs_phase,
         );
 
         if needs_redraw {

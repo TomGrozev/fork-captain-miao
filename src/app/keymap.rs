@@ -323,8 +323,8 @@ pub(super) enum Command {
     MessageLog,
     /// Open the preferences overlay.
     Preferences,
-    /// Open the version-control panel for the selected session.
-    VcsPanel,
+    /// Open the full session record. The side detail panel keeps the glance.
+    SessionDetail,
     /// Publish the selected session's branch.
     VcsPush,
     /// Fast-forward the selected session from its upstream.
@@ -374,7 +374,7 @@ impl Command {
             Command::ManageHosts => "manage_hosts",
             Command::MessageLog => "messages",
             Command::Preferences => "preferences",
-            Command::VcsPanel => "vcs_panel",
+            Command::SessionDetail => "session_detail",
             Command::VcsPush => "vcs_push",
             Command::VcsPull => "vcs_pull",
         }
@@ -433,7 +433,7 @@ impl Command {
             Command::ManageHosts => "manage remote hosts",
             Command::MessageLog => "message log (status messages the footer showed)",
             Command::Preferences => "open preferences",
-            Command::VcsPanel => "open version control",
+            Command::SessionDetail => "session record (pid, terminfo, context, first prompt)",
             Command::VcsPush => "push the branch",
             Command::VcsPull => "pull from the remote (fast-forward only)",
         }
@@ -481,27 +481,23 @@ impl Command {
             Command::ManageHosts => "hosts",
             Command::MessageLog => "messages",
             Command::Preferences => "prefs",
-            Command::VcsPanel => "status",
+            Command::SessionDetail => "session",
             Command::VcsPush => "push",
             Command::VcsPull => "pull",
         }
     }
 
     fn is_vcs(self) -> bool {
-        matches!(
-            self,
-            Command::VcsPanel | Command::VcsPush | Command::VcsPull
-        )
+        matches!(self, Command::VcsPush | Command::VcsPull)
     }
 
     fn is_toggle(self) -> bool {
         matches!(
             self,
-            Command::TogglePin
-                | Command::ToggleFollowUp
-                | Command::TogglePreview
+            Command::TogglePreview
                 | Command::ToggleDetail
                 | Command::ToggleKeepAwake
+                | Command::SessionDetail
         )
     }
 }
@@ -534,16 +530,16 @@ const DEFAULTS: &[(Command, &[&str])] = &[
     (Command::ScrollPreviewDown,  &["ctrl+d"]),
     (Command::ScrollPreviewLeft,  &["h", "left", "<"]),
     (Command::ScrollPreviewRight, &["l", "right", ">"]),
+    (Command::TogglePin,          &["p"]),
+    (Command::ToggleFollowUp,     &["i"]),
     (Command::Search,             &["/"]),
     (Command::ClearSearch,        &["esc"]),
     (Command::Help,               &["?"]),
     (Command::Quit,               &["q"]),
     (Command::TogglePreview,      &["space t v"]),
     (Command::ToggleDetail,       &["space t d"]),
-    (Command::TogglePin,          &["space t p"]),
-    (Command::ToggleFollowUp,     &["space t i"]),
+    (Command::SessionDetail,      &["space t s"]),
     (Command::ToggleKeepAwake,    &["space t z"]),
-    (Command::VcsPanel,           &["space v s"]),
     (Command::VcsPush,            &["space v p"]),
     (Command::VcsPull,            &["space v l"]),
     (Command::RestartSelected,    &["space e"]),
@@ -938,9 +934,16 @@ mod tests {
             Some(&("v".to_string(), Continuation::Run(Command::TogglePreview)))
         );
         assert!(toggles.contains(&("d".to_string(), Continuation::Run(Command::ToggleDetail))));
-        assert!(toggles.contains(&("p".to_string(), Continuation::Run(Command::TogglePin))));
-        assert!(toggles.contains(&("i".to_string(), Continuation::Run(Command::ToggleFollowUp))));
+        assert!(toggles.contains(&("s".to_string(), Continuation::Run(Command::SessionDetail))));
         assert!(toggles.contains(&("z".to_string(), Continuation::Run(Command::ToggleKeepAwake))));
+        assert!(!toggles.iter().any(|(_, c)| {
+            matches!(
+                c,
+                Continuation::Run(Command::TogglePin | Command::ToggleFollowUp)
+            )
+        }));
+        assert_eq!(km.lookup_single(chord("p")), Some(Command::TogglePin));
+        assert_eq!(km.lookup_single(chord("i")), Some(Command::ToggleFollowUp));
         assert_eq!(km.lookup_single(chord("v")), None);
         assert!(km.continuations(&[chord("x")]).is_empty());
     }
@@ -1092,7 +1095,7 @@ mod tests {
             ("edit_dir", "ctrl+x i"),
             ("keep_awake", "ctrl+x z"),
             ("default_agent", "ctrl+x a"),
-            ("vcs_panel", "ctrl+x s"),
+            ("session_detail", "ctrl+x s"),
             ("vcs_push", "ctrl+x p"),
             ("vcs_pull", "ctrl+x l"),
         ];

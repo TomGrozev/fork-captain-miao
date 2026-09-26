@@ -295,13 +295,14 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `gg` / `G`            | Jump to top / bottom                                                                                                                                                       |
 | `1..9` / `Ctrl-1..9`  | Select Nth session / select and focus its window                                                                                                                           |
-| `Space t p` / `Space t i` | Pin / toggle needs-input on the selected session                                                                                                                           |
+| `p` / `i`             | Pin / toggle needs-input on the selected session                                                                                                                           |
 | `y`                   | Copy the selected session id to the clipboard                                                                                                                              |
 | `t` / `w`             | Move window to tab (Kitty and tmux) / switch to or open the cwd's work tab                                                                                                 |
 | `h`/`l`, `←`/`→`      | Scroll the preview horizontally                                                                                                                                            |
 | `Ctrl-u` / `Ctrl-d`   | Scroll the preview up / down                                                                                                                                               |
 | `R`                   | Refresh the preview now                                                                                                                                                    |
 | `Space t v` / `Space t d` | Toggle the preview / detail panel                                                                                                                                          |
+| `Space t s`           | Session record — pid, terminfo, context, updated, and the first prompt (`Esc` closes)                                                                                      |
 | `Space i`             | Edit the selected directory's icon + color                                                                                                                                 |
 | `Space e` / `Space E` | Restart the selected / all idle sessions                                                                                                                                   |
 | `Space t z`           | Toggle keep-awake (inhibit OS sleep while sessions work)                                                                                                                   |
@@ -314,9 +315,9 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
 
-Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, pin, needs-input, and keep-awake. `Space v` opens version control: `s` the panel, `p` push, `l` pull (fast-forward only).
+Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
-The **Detail** panel shows the full session ID and its copy shortcut. Troubled
+The **Detail** panel shows the full session ID and its copy shortcut, and the selected checkout: branch, upstream, how far ahead or behind, and whether the tree is dirty. That read runs off the UI thread; the panel shows a spinner until it arrives, and marks a checkout that is behind its remote. `Space t s` opens the rest of the record — pid, terminfo, context, when the session last updated, and the first prompt. Troubled
 sessions show connection or cleanup information with available recovery keys;
 narrow layouts prioritize those hints. For Codex app-server sessions, a forced
 removal reports whether the thread was missing or the server was unreachable,

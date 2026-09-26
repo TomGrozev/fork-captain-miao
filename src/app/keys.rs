@@ -90,7 +90,7 @@ impl App {
             return None;
         }
         match self.input_mode {
-            InputMode::Normal if self.vcs_panel => self.handle_vcs_panel_key(key),
+            InputMode::Normal if self.session_detail => self.handle_session_detail_key(key),
             InputMode::Normal => self.handle_normal_key(key),
             InputMode::Search => self.handle_search_key(key),
             InputMode::Picker => self.handle_picker_key(key),
@@ -108,7 +108,9 @@ impl App {
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
         // Only process mouse events in Normal mode; inputs/pickers consume keys only.
-        if self.input_mode != InputMode::Normal {
+        // The session record is modal too: a click must not change the row
+        // underneath it.
+        if self.input_mode != InputMode::Normal || self.session_detail {
             return None;
         }
         let pt = (mouse.column, mouse.row);
@@ -252,30 +254,31 @@ impl App {
     // Normal mode, and the command table
     // =============================================================================
 
-    fn handle_vcs_panel_key(&mut self, key: KeyEvent) -> Option<Action> {
+    fn handle_session_detail_key(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.vcs_panel = false;
+                self.session_detail = false;
                 None
             }
-            KeyCode::Char('p') => self.confirm_vcs(true),
-            KeyCode::Char('l') => self.confirm_vcs(false),
-            KeyCode::Char('r') => {
-                self.vcs_due_now();
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.session_detail_scroll = self.session_detail_scroll.saturating_add(1);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.session_detail_scroll = self.session_detail_scroll.saturating_sub(1);
+                None
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.session_detail_scroll = 0;
+                None
+            }
+            // The draw clamps this to the last line that still fills the popup.
+            KeyCode::Char('G') | KeyCode::End => {
+                self.session_detail_scroll = usize::MAX;
                 None
             }
             _ => None,
         }
-    }
-
-    /// Forget the poll clock for the selected checkout so the next loop asks now.
-    fn vcs_due_now(&mut self) {
-        let Some(session) = self.selected_session() else {
-            return;
-        };
-        let slot = self.vcs.entry((session.host, session.cwd)).or_default();
-        slot.asked = None;
-        slot.inflight = false;
     }
 
     /// Arm a push or pull, or refuse when the snapshot says it would not mean
@@ -666,13 +669,11 @@ impl App {
                 self.open_prefs();
                 None
             }
-            Command::VcsPanel => {
-                if self.selected_session().is_none() {
-                    self.set_status("no session selected".to_string(), true);
-                    return None;
+            Command::SessionDetail => {
+                self.session_detail = !self.session_detail;
+                if self.session_detail {
+                    self.session_detail_scroll = 0;
                 }
-                self.vcs_panel = true;
-                self.vcs_due_now();
                 None
             }
             Command::VcsPush => self.confirm_vcs(true),
