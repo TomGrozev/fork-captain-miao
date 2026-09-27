@@ -31,31 +31,6 @@ use super::{Action, App, DragTarget, InputMode, PickerKind, SessionFlag};
 /// Max gap between two left-clicks on the same row to count as a double-click.
 const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(500);
 
-fn commits(n: u32) -> String {
-    if n == 1 {
-        "1 commit".to_string()
-    } else {
-        format!("{n} commits")
-    }
-}
-
-fn vcs_outcome_text(snap: &cm_core::vcs::VcsSnapshot) -> String {
-    use cm_core::vcs::VcsOutcome;
-    match snap.outcome {
-        VcsOutcome::Unsupported => format!(
-            "{} is not supported",
-            snap.system.as_deref().unwrap_or("this system")
-        ),
-        VcsOutcome::NotACheckout => "not a version-control checkout".to_string(),
-        VcsOutcome::Missing => "directory is gone".to_string(),
-        VcsOutcome::Denied => "permission denied".to_string(),
-        VcsOutcome::TimedOut => "timed out".to_string(),
-        VcsOutcome::NoTool => "git is not on PATH".to_string(),
-        VcsOutcome::Error => "git failed".to_string(),
-        VcsOutcome::Ready => "ready".to_string(),
-    }
-}
-
 // =============================================================================
 // Entry points: one per input device
 // =============================================================================
@@ -84,6 +59,7 @@ pub(super) fn cycle_agent(current: AgentControl, available: &[AgentControl]) -> 
 
 impl App {
     pub(super) fn handle_key(&mut self, key: KeyEvent) -> Option<Action> {
+        self.vcs_prepare_seq = self.vcs_prepare_seq.wrapping_add(1);
         // Ctrl+c always quits, regardless of current mode.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
@@ -107,6 +83,7 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
+        self.vcs_prepare_seq = self.vcs_prepare_seq.wrapping_add(1);
         // Only process mouse events in Normal mode; inputs/pickers consume keys only.
         // The session record is modal too: a click must not change the row
         // underneath it.
@@ -281,49 +258,39 @@ impl App {
         }
     }
 
-    /// Arm a push or pull, or refuse when the snapshot says it would not mean
-    /// anything. The command itself runs off the UI thread.
-    fn confirm_vcs(&mut self, push: bool) -> Option<Action> {
+    fn prepare_vcs(&mut self, push: bool) -> Option<Action> {
         let Some(session) = self.selected_session() else {
             self.set_status("no session selected".to_string(), true);
             return None;
         };
-        let key = (session.host.clone(), session.cwd.clone());
-        let view = self.vcs.get(&key).map(|slot| slot.view.clone());
-        let Some(super::VcsView::Snapshot(snap)) = view else {
-            self.set_status("version control status has not arrived".to_string(), true);
-            return None;
+        Some(Action::VcsPrepare {
+            host: session.host,
+            cwd: session.cwd,
+            push,
+            seq: self.vcs_prepare_seq,
+        })
+    }
+
+    /// Confirm the host's resolved target, independent of the display cache.
+    pub(super) fn confirm_vcs(&mut self, plan: Box<cm_core::vcs::VcsPlan>) {
+        let Some(session) = self.selected_session() else {
+            return;
         };
-        if snap.outcome != cm_core::vcs::VcsOutcome::Ready {
-            self.set_status(vcs_outcome_text(&snap), true);
-            return None;
-        }
-        if let Some(operation) = &snap.operation {
-            self.set_status(format!("{operation} in progress"), true);
-            return None;
-        }
-        if push && snap.detached {
-            self.set_status("detached; there is no branch to push".to_string(), true);
-            return None;
-        }
-        if push && snap.upstream.is_some() && snap.ahead == 0 {
-            self.set_status("nothing to push".to_string(), false);
-            return None;
-        }
-        if !push && snap.upstream.is_none() {
-            self.set_status("no upstream".to_string(), true);
-            return None;
-        }
-        let prompt = if push {
-            match &snap.upstream {
-                Some(upstream) => format!("Push {} to {upstream}? [y/N]", commits(snap.ahead)),
-                None => "Push this branch and set its upstream? [y/N]".to_string(),
-            }
+        let short = |oid: &str| oid.chars().take(12).collect::<String>();
+        let prompt = if plan.push {
+            format!(
+                "Push {} at {} to {}? [y/N]",
+                plan.branch,
+                short(&plan.commit),
+                plan.destination()
+            )
         } else {
             format!(
-                "Pull from {} (fast-forward only, {})? [y/N]",
-                snap.upstream.as_deref().unwrap_or(""),
-                commits(snap.behind)
+                "Fast-forward {} at {} to {} at {}? [y/N]",
+                plan.branch,
+                short(&plan.commit),
+                plan.destination(),
+                short(plan.target_commit.as_deref().unwrap_or(""))
             )
         };
         self.pending_confirm = Some(super::PendingConfirm {
@@ -331,11 +298,10 @@ impl App {
             action: Action::VcsRun {
                 host: session.host,
                 cwd: session.cwd,
-                push,
+                plan,
             },
         });
         self.input_mode = InputMode::Confirm;
-        None
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -676,8 +642,8 @@ impl App {
                 }
                 None
             }
-            Command::VcsPush => self.confirm_vcs(true),
-            Command::VcsPull => self.confirm_vcs(false),
+            Command::VcsPush => self.prepare_vcs(true),
+            Command::VcsPull => self.prepare_vcs(false),
             Command::Quit => {
                 self.should_quit = true;
                 None

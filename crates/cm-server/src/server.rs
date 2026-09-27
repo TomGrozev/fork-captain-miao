@@ -970,9 +970,10 @@ async fn handle_conn(
                         write_frame(&mut wr, &codex_config_reply(req_id, result)).await?;
                     }
                     ClientFrame::GetVcsStatus { req_id, cwd } => {
+                        let deadline = std::time::Instant::now() + cm_core::vcs::STATUS_LIMIT;
                         let tx = replies_tx.clone();
                         tokio::spawn(async move {
-                            let snapshot = tokio::task::spawn_blocking(move || cm_core::vcs::status(&cwd))
+                            let snapshot = tokio::task::spawn_blocking(move || cm_core::vcs::status_with_deadline(&cwd, deadline))
                                 .await
                                 .unwrap_or_else(|_| cm_core::vcs::VcsSnapshot {
                                     outcome: cm_core::vcs::VcsOutcome::Error,
@@ -981,11 +982,26 @@ async fn handle_conn(
                             let _ = tx.send(ServerFrame::VcsStatus { req_id, snapshot });
                         });
                     }
-                    ClientFrame::VcsPush { req_id, cwd } => {
-                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, cm_core::vcs::push);
+                    ClientFrame::VcsPush { req_id, .. } | ClientFrame::VcsPull { req_id, .. } => {
+                        write_frame(&mut wr, &ServerFrame::VcsCommandDone {
+                            req_id, ok: false, message: "update the dashboard to use checked Git commands".into(),
+                        }).await?;
                     }
-                    ClientFrame::VcsPull { req_id, cwd } => {
-                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, cm_core::vcs::pull);
+                    ClientFrame::PrepareVcs { req_id, cwd, push } => {
+                        let deadline = std::time::Instant::now() + cm_core::vcs::COMMAND_LIMIT;
+                        let tx = replies_tx.clone();
+                        tokio::spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || cm_core::vcs::prepare(&cwd, push, deadline))
+                                .await.unwrap_or_else(|_| Err("git failed".into()));
+                            let (plan, error) = match result {
+                                Ok(plan) => (Some(Box::new(plan)), None),
+                                Err(error) => (None, Some(error)),
+                            };
+                            let _ = tx.send(ServerFrame::VcsPrepared { req_id, plan, error });
+                        });
+                    }
+                    ClientFrame::RunVcs { req_id, cwd, plan } => {
+                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, plan);
                     }
                     // A newer client's frame we don't know. Ignoring it keeps
                     // the connection alive (protocol §3 forward tolerance); a
@@ -1107,17 +1123,16 @@ fn start_sessions_watcher(tx: broadcast::Sender<()>) -> notify::Result<notify::R
     Ok(w)
 }
 
-/// Best-effort human label for this host, surfaced in the handshake. The
-/// dashboard sets its own display label per the hosts list, so this is only a
-/// diagnostic hint.
 fn spawn_vcs_command(
     tx: tokio::sync::mpsc::UnboundedSender<ServerFrame>,
     req_id: u64,
     cwd: String,
-    run: fn(&str) -> Result<String, String>,
+    plan: Box<cm_core::vcs::VcsPlan>,
 ) {
+    let deadline = std::time::Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || run(&cwd)).await;
+        let result =
+            tokio::task::spawn_blocking(move || cm_core::vcs::execute(&cwd, &plan, deadline)).await;
         let (ok, message) = match result {
             Ok(Ok(message)) => (true, message),
             Ok(Err(message)) => (false, message),
@@ -1131,6 +1146,7 @@ fn spawn_vcs_command(
     });
 }
 
+/// Best-effort diagnostic label; the dashboard owns the display label.
 fn host_label() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -1145,6 +1161,75 @@ fn host_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_vcs_commands_are_refused_and_connection_survives() {
+        let (mut dashboard, stream) = tokio::net::UnixStream::pair().unwrap();
+        let (changes, rx) = broadcast::channel(16);
+        let server = tokio::spawn(handle_conn(
+            stream,
+            Arc::new(LocalBackend::new()),
+            Arc::new(tokio::sync::Mutex::new(VitalsProbe::new())),
+            rx,
+            changes,
+            "test-host".into(),
+        ));
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::Hello {
+                client_version: VERSION.into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut dashboard).await.unwrap(),
+            Some(ServerFrame::Welcome { .. })
+        ));
+        for request in [
+            ClientFrame::VcsPush {
+                req_id: 1,
+                cwd: "/tmp".into(),
+            },
+            ClientFrame::VcsPull {
+                req_id: 1,
+                cwd: "/tmp".into(),
+            },
+        ] {
+            write_frame(&mut dashboard, &request).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut dashboard))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(reply, Some(ServerFrame::VcsCommandDone { req_id: 1, ok: false, message }) if message.contains("update the dashboard"))
+            );
+        }
+        write_frame(
+            &mut dashboard,
+            &ClientFrame::PrepareVcs {
+                req_id: 2,
+                cwd: "/no/such/vcs-checkout".into(),
+                push: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), read_frame(&mut dashboard))
+                .await
+                .unwrap()
+                .unwrap(),
+            Some(ServerFrame::VcsPrepared {
+                req_id: 2,
+                plan: None,
+                error: Some(_)
+            })
+        ));
+        drop(dashboard);
+        server.await.unwrap().unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_vitals_does_not_delay_host_requests() {

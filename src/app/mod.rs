@@ -220,11 +220,18 @@ pub(super) enum Action {
     },
     /// Copy the selected session's id to the system clipboard (via OSC 52).
     CopySessionId(String),
+    /// Read current checkout status before offering a push/pull confirmation.
+    VcsPrepare {
+        host: HostId,
+        cwd: String,
+        push: bool,
+        seq: u64,
+    },
     /// Push or pull the selected session's checkout. Runs off the UI thread.
     VcsRun {
         host: HostId,
         cwd: String,
-        push: bool,
+        plan: Box<cm_core::vcs::VcsPlan>,
     },
     /// Attach a local window to an already-running remote pool session (§5):
     /// spawn `ssh -t <host> miao-server attach <pool_session>` and bind it.
@@ -322,6 +329,7 @@ impl Action {
             Action::UpgradeHost { .. } => "UpgradeHost",
             Action::GrantConsent(_) => "GrantConsent",
             Action::VcsRun { .. } => "VcsRun",
+            Action::VcsPrepare { .. } => "VcsPrepare",
         }
     }
 }
@@ -1135,6 +1143,9 @@ pub(super) struct App {
     /// Last status per `(host, cwd)`. The UI thread only reads this; probes
     /// land through the event loop.
     pub(super) vcs: HashMap<(HostId, String), VcsSlot>,
+    /// Input invalidates an outstanding command preparation, so a delayed
+    /// reply cannot open a confirmation after the user has moved on.
+    pub(super) vcs_prepare_seq: u64,
     /// User toggle for the detail panel. Manual toggle always wins.
     pub(super) detail_visible: bool,
     /// First-draw defaults have been picked based on the initial viewport
@@ -1691,6 +1702,7 @@ impl App {
             session_detail: false,
             session_detail_scroll: 0,
             vcs: HashMap::new(),
+            vcs_prepare_seq: 0,
             detail_visible: true,
             panels_initialized: false,
             drag: None,

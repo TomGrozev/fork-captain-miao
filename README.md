@@ -317,6 +317,24 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
+Push and pull read fresh checkout status before asking for confirmation, even
+when the Detail panel is hidden. Further keyboard or mouse input cancels a
+pending confirmation read. A deleted tracking branch appears as `upstream gone`;
+push offers to recreate it instead of reporting that the checkout is in sync.
+
+Confirmation names the branch, commit, and destination. Push uses Git's configured
+push remote and publishes exactly that commit to one branch, without force or
+extra tags. Mirror, wildcard, and multiple-ref pushes must be run outside the
+dashboard. Pull fetches its candidate before confirmation and fast-forwards only
+to that commit. A changed checkout, commit, or destination requires a new
+confirmation. These checks do not lock out other programs using the checkout.
+
+Commands have a 60-second host-side budget, including queueing and cleanup. On
+timeout, the dashboard stops its Git process group and reports an unknown outcome
+if an update may have started; check the checkout and remote before retrying.
+Commands are never retried automatically. Remote commands require an updated
+server; older dashboards must also update before issuing commands to a new server.
+
 The **Detail** panel shows the full session ID and its copy shortcut, and the selected checkout: branch, upstream, how far ahead (`↑`) or behind (`↓`), and the working tree (clean, dirty, or mid-operation). That read runs off the UI thread; the panel shows a spinner until it arrives, and marks a checkout that is behind its remote. `Space t s` opens the rest of the record — pid, terminfo, context, when the session last updated, and the first prompt. Troubled
 sessions show connection or cleanup information with available recovery keys;
 narrow layouts prioritize those hints. For Codex app-server sessions, a forced

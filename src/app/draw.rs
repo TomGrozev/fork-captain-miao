@@ -368,17 +368,13 @@ impl App {
         let Some(pending) = self.pending_confirm.as_ref() else {
             return;
         };
-        let popup = centered_rect(60, 20, area);
-        clear_overlay(frame, popup);
+        let mut popup = centered_rect(60, 20, area);
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
             " Confirm ",
             Style::default()
                 .fg(config::get().colors.ui.attention_fg)
                 .bold(),
         ));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-
         let lines = vec![
             Line::from(""),
             Line::from(Span::raw(pending.prompt.clone())),
@@ -393,6 +389,17 @@ impl App {
         let para = Paragraph::new(lines)
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false });
+        let needed = para
+            .line_count(popup.width.saturating_sub(2))
+            .saturating_add(2);
+        popup.height = popup
+            .height
+            .max(needed.min(u16::MAX as usize) as u16)
+            .min(area.height);
+        popup.y = area.y + area.height.saturating_sub(popup.height) / 2;
+        let inner = block.inner(popup);
+        clear_overlay(frame, popup);
+        frame.render_widget(block, popup);
         frame.render_widget(para, inner);
     }
 
@@ -902,14 +909,13 @@ impl App {
         frame.render_widget(block, popup);
         let lines = self.session_record_lines(inner.width as usize);
         let rows = inner.height as usize;
-        let max_scroll = lines.len().saturating_sub(rows);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        let max_scroll = paragraph.line_count(inner.width).saturating_sub(rows);
         self.session_detail_scroll = self.session_detail_scroll.min(max_scroll);
-        let visible: Vec<Line> = lines
-            .into_iter()
-            .skip(self.session_detail_scroll)
-            .take(rows)
-            .collect();
-        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), inner);
+        frame.render_widget(
+            paragraph.scroll((self.session_detail_scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
     }
 
     /// The host half of a row's icon cell, and whether it's a *foreign-terminal*
@@ -2166,6 +2172,10 @@ fn vcs_sync_line(
     info: Style,
 ) -> Line<'static> {
     let mut spans = vec![vcs_label("Sync")];
+    if snap.upstream_gone {
+        spans.push(Span::styled("upstream gone", attention));
+        return Line::from(spans);
+    }
     if snap.upstream.is_none() {
         spans.push(Span::styled("—", dim));
         return Line::from(spans);

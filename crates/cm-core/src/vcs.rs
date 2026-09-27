@@ -10,18 +10,24 @@
 //! lock, so a slow status cannot overlap a push in this process. The lock is
 //! not held by anything but these functions.
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
+#[cfg(test)]
+use std::process::Command;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-const STATUS_LIMIT: Duration = Duration::from_secs(30);
+mod command;
+mod process;
+pub use command::{VcsPlan, execute, prepare};
+use process::{GitOut, RunFail, run_git, run_git_read};
+
+pub const STATUS_LIMIT: Duration = Duration::from_secs(30);
 const FOLLOWUP_LIMIT: Duration = Duration::from_secs(2);
-const COMMAND_LIMIT: Duration = Duration::from_secs(60);
+pub const COMMAND_LIMIT: Duration = Duration::from_secs(60);
 const OUTPUT_CAP: u64 = 64 * 1024;
 
 static GIT: Mutex<()> = Mutex::new(());
@@ -52,6 +58,9 @@ pub struct VcsSnapshot {
     pub detached: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
+    /// The tracking branch is configured, but its ref no longer exists.
+    #[serde(default)]
+    pub upstream_gone: bool,
     /// Commits here that the upstream does not have. Zero when there is no upstream.
     #[serde(default)]
     pub ahead: u32,
@@ -84,6 +93,7 @@ impl VcsSnapshot {
             head: None,
             detached: false,
             upstream: None,
+            upstream_gone: false,
             ahead: 0,
             behind: 0,
             operation: None,
@@ -102,28 +112,35 @@ impl VcsSnapshot {
 
 /// Status of `cwd`. `cwd` may be host-canonical (`~/…`); it is expanded here.
 pub fn status(cwd: &str) -> VcsSnapshot {
-    let _guard = GIT.lock().unwrap_or_else(|err| err.into_inner());
-    status_locked(&expand(cwd))
+    status_with_deadline(cwd, Instant::now() + STATUS_LIMIT)
 }
 
-/// Publish the current branch. No `--force`. With no upstream and exactly one
-/// remote, sets that upstream. Returns a short message either way.
-pub fn push(cwd: &str) -> Result<String, String> {
-    let _guard = GIT.lock().unwrap_or_else(|err| err.into_inner());
-    push_locked(&expand(cwd))
+/// The caller starts the budget before queueing its worker.
+pub fn status_with_deadline(cwd: &str, deadline: Instant) -> VcsSnapshot {
+    let Ok(_guard) = lock_until(deadline) else {
+        return VcsSnapshot::outcome(VcsOutcome::TimedOut);
+    };
+    status_locked(&expand(cwd), deadline)
 }
 
-/// `git pull --ff-only`. A non-fast-forward leaves the tree untouched.
-pub fn pull(cwd: &str) -> Result<String, String> {
-    let _guard = GIT.lock().unwrap_or_else(|err| err.into_inner());
-    pull_locked(&expand(cwd))
+fn lock_until(deadline: Instant) -> Result<MutexGuard<'static, ()>, RunFail> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(RunFail::TimedOut);
+        }
+        match GIT.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(err)) => return Ok(err.into_inner()),
+            Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(5)),
+        }
+    }
 }
 
 fn expand(cwd: &str) -> PathBuf {
     PathBuf::from(crate::paths::expand_home(cwd, &crate::paths::host_home()))
 }
 
-fn status_locked(cwd: &Path) -> VcsSnapshot {
+fn status_locked(cwd: &Path, deadline: Instant) -> VcsSnapshot {
     let Some(system) = detect(cwd) else {
         return if cwd.exists() {
             VcsSnapshot::outcome(VcsOutcome::NotACheckout)
@@ -139,8 +156,7 @@ fn status_locked(cwd: &Path) -> VcsSnapshot {
     if system != "git" {
         return VcsSnapshot::unsupported(system);
     }
-    let deadline = Instant::now() + STATUS_LIMIT;
-    let output = match run_git(
+    let output = match run_git_read(
         cwd,
         &[
             "--no-optional-locks",
@@ -151,6 +167,7 @@ fn status_locked(cwd: &Path) -> VcsSnapshot {
             "-z",
         ],
         deadline,
+        read_status,
     ) {
         Ok(output) => output,
         Err(RunFail::NoTool) => return VcsSnapshot::outcome(VcsOutcome::NoTool),
@@ -161,69 +178,16 @@ fn status_locked(cwd: &Path) -> VcsSnapshot {
     if !output.status_ok {
         return VcsSnapshot::outcome(VcsOutcome::Error);
     }
-    let mut snap = parse_status(&output.stdout);
+    let mut snap = output.stdout;
+    if snap.outcome != VcsOutcome::Ready {
+        return snap;
+    }
     snap.system = Some("git".to_string());
     snap.outcome = VcsOutcome::Ready;
-    let follow = Instant::now() + FOLLOWUP_LIMIT;
+    let follow = deadline.min(Instant::now() + FOLLOWUP_LIMIT);
     snap.operation = operation(cwd, follow);
     snap.workspace = workspace(cwd, follow);
     snap
-}
-
-fn push_locked(cwd: &Path) -> Result<String, String> {
-    let snap = status_locked(cwd);
-    if snap.outcome != VcsOutcome::Ready {
-        return Err(outcome_message(&snap));
-    }
-    if snap.detached {
-        return Err("detached; there is no branch to push".to_string());
-    }
-    if snap.operation.is_some() {
-        return Err(format!(
-            "{} in progress",
-            snap.operation.unwrap_or_default()
-        ));
-    }
-    if snap.upstream.is_some() && snap.ahead == 0 {
-        return Ok("nothing to push".to_string());
-    }
-    let deadline = Instant::now() + COMMAND_LIMIT;
-    let result = if snap.upstream.is_some() {
-        run_git(cwd, &["--no-optional-locks", "push"], deadline)
-    } else {
-        let remotes = remotes(cwd, deadline)?;
-        match remotes.len() {
-            0 => return Err("no remote".to_string()),
-            1 => run_git(
-                cwd,
-                &["--no-optional-locks", "push", "-u", &remotes[0], "HEAD"],
-                deadline,
-            ),
-            _ => return Err(format!("several remotes: {}", remotes.join(", "))),
-        }
-    };
-    finish_command(result, "pushed")
-}
-
-fn pull_locked(cwd: &Path) -> Result<String, String> {
-    let snap = status_locked(cwd);
-    if snap.outcome != VcsOutcome::Ready {
-        return Err(outcome_message(&snap));
-    }
-    if snap.upstream.is_none() {
-        return Err("no upstream".to_string());
-    }
-    if snap.operation.is_some() {
-        return Err(format!(
-            "{} in progress",
-            snap.operation.unwrap_or_default()
-        ));
-    }
-    let deadline = Instant::now() + COMMAND_LIMIT;
-    finish_command(
-        run_git(cwd, &["--no-optional-locks", "pull", "--ff-only"], deadline),
-        "pulled",
-    )
 }
 
 fn outcome_message(snap: &VcsSnapshot) -> String {
@@ -246,7 +210,10 @@ fn finish_command(result: Result<GitOut, RunFail>, ok_word: &str) -> Result<Stri
     match result {
         Ok(output) if output.status_ok => Ok(ok_word.to_string()),
         Ok(output) => Err(first_line(&output.stderr).unwrap_or_else(|| "git failed".to_string())),
-        Err(RunFail::TimedOut) => Err("timed out".to_string()),
+        Err(RunFail::TimedOut) => Err(
+            "timed out; outcome unknown — verify the checkout and remote before retrying"
+                .to_string(),
+        ),
         Err(RunFail::NoTool) => Err("git is not on PATH".to_string()),
         Err(RunFail::Denied) => Err("permission denied".to_string()),
         Err(RunFail::Message(message)) => Err(message),
@@ -260,69 +227,14 @@ fn first_line(bytes: &[u8]) -> Option<String> {
     Some(crate::paths::collapse_home(line.trim(), &home))
 }
 
-enum RunFail {
-    NoTool,
-    TimedOut,
-    Denied,
-    Message(String),
-}
-
-struct GitOut {
-    status_ok: bool,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-fn run_git(cwd: &Path, args: &[&str], deadline: Instant) -> Result<GitOut, RunFail> {
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                RunFail::NoTool
-            } else if err.kind() == std::io::ErrorKind::PermissionDenied {
-                RunFail::Denied
-            } else {
-                RunFail::Message(err.to_string())
-            }
-        })?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_thread = thread::spawn(move || read_capped(stdout));
-    let err_thread = thread::spawn(move || read_capped(stderr));
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = out_thread.join();
-                let _ = err_thread.join();
-                return Err(RunFail::TimedOut);
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(20)),
-            Err(err) => return Err(RunFail::Message(err.to_string())),
-        }
-    };
-    let stdout = out_thread.join().unwrap_or_default();
-    let stderr = err_thread.join().unwrap_or_default();
-    Ok(GitOut {
-        status_ok: status.success(),
-        stdout,
-        stderr,
-    })
-}
-
 fn read_capped(pipe: Option<impl Read>) -> Vec<u8> {
-    let Some(pipe) = pipe else {
+    let Some(mut pipe) = pipe else {
         return Vec::new();
     };
     let mut buf = Vec::new();
-    let _ = pipe.take(OUTPUT_CAP).read_to_end(&mut buf);
+    let _ = pipe.by_ref().take(OUTPUT_CAP).read_to_end(&mut buf);
+    // Keep draining after the retention cap: closing early gives Git SIGPIPE.
+    let _ = std::io::copy(&mut pipe, &mut std::io::sink());
     buf
 }
 
@@ -349,10 +261,20 @@ fn detect(cwd: &Path) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn parse_status(bytes: &[u8]) -> VcsSnapshot {
+    read_status(bytes)
+}
+
+/// Summarize every record without retaining the checkout's complete file list.
+fn read_status(reader: impl Read) -> VcsSnapshot {
     let mut snap = VcsSnapshot::outcome(VcsOutcome::Ready);
-    let text = String::from_utf8_lossy(bytes);
-    for record in text.split('\0') {
+    let mut records = BufReader::new(reader).split(0);
+    while let Some(record) = records.next() {
+        let Ok(record) = record else {
+            return VcsSnapshot::outcome(VcsOutcome::Error);
+        };
+        let record = String::from_utf8_lossy(&record);
         let record = record.trim_end_matches(['\n', '\r']);
         if record.is_empty() {
             continue;
@@ -367,6 +289,13 @@ fn parse_status(bytes: &[u8]) -> VcsSnapshot {
         let b = chars.next().unwrap_or(' ');
         if is_unmerged(a, b) {
             snap.conflicts = true;
+        }
+        // Porcelain -z encodes a rename/copy as status + destination + NUL +
+        // source + NUL. The source is a pathname, even if it starts with "UU".
+        if (matches!(a, 'R' | 'C') || matches!(b, 'R' | 'C'))
+            && !matches!(records.next(), Some(Ok(_)))
+        {
+            return VcsSnapshot::outcome(VcsOutcome::Error);
         }
     }
     snap
@@ -391,7 +320,9 @@ fn apply_header(snap: &mut VcsSnapshot, header: &str) {
     if let Some(tracking) = tracking {
         for part in tracking.split(',') {
             let part = part.trim();
-            if let Some(n) = part.strip_prefix("ahead ") {
+            if part == "gone" {
+                snap.upstream_gone = true;
+            } else if let Some(n) = part.strip_prefix("ahead ") {
                 snap.ahead = n.parse().unwrap_or(0);
             } else if let Some(n) = part.strip_prefix("behind ") {
                 snap.behind = n.parse().unwrap_or(0);
@@ -474,6 +405,11 @@ fn remotes(cwd: &Path, deadline: Instant) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
+    fn push(cwd: &str) -> Result<String, String> {
+        let plan = prepare(cwd, true, Instant::now() + COMMAND_LIMIT)?;
+        execute(cwd, &plan, Instant::now() + COMMAND_LIMIT)
+    }
+
     fn git(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")
             .args(args)
@@ -525,7 +461,14 @@ mod tests {
         let pushed = push(root.to_str().unwrap()).unwrap();
         assert_eq!(pushed, "pushed");
         let again = push(root.to_str().unwrap()).unwrap();
-        assert_eq!(again, "nothing to push");
+        assert_eq!(again, "pushed");
+
+        git(&bare, &["update-ref", "-d", "refs/heads/main"]);
+        git(&root, &["fetch", "--prune"]);
+        let gone = status(root.to_str().unwrap());
+        assert!(gone.upstream_gone);
+        assert_eq!(push(root.to_str().unwrap()).unwrap(), "pushed");
+        assert!(!status(root.to_str().unwrap()).upstream_gone);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&bare);
@@ -555,5 +498,60 @@ mod tests {
         assert_eq!(snap.upstream.as_deref(), Some("origin/main"));
         assert_eq!(snap.ahead, 2);
         assert_eq!(snap.behind, 1);
+    }
+
+    #[test]
+    fn renamed_paths_are_not_status_records() {
+        for source in ["AUTHORS", "## misleading...origin/other", "UU file"] {
+            let bytes = format!("## main\0R  renamed\0{source}\0");
+            let snap = parse_status(bytes.as_bytes());
+            assert_eq!(snap.head.as_deref(), Some("main"));
+            assert!(snap.dirty);
+            assert!(!snap.conflicts, "rename source: {source}");
+        }
+        let snap = parse_status(b"## main\0R  renamed\0AUTHORS\0UU real-conflict\0");
+        assert!(snap.conflicts);
+    }
+
+    #[test]
+    fn capped_output_is_fully_drained() {
+        let bytes = vec![b'x'; OUTPUT_CAP as usize + 4096];
+        let mut reader = std::io::Cursor::new(&bytes);
+        let retained = read_capped(Some(&mut reader));
+        assert_eq!(retained.len(), OUTPUT_CAP as usize);
+        assert_eq!(reader.position(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn large_status_output_remains_readable() {
+        let root = std::env::temp_dir().join(format!("cm-vcs-large-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-b", "main"]);
+        for i in 0..1024 {
+            std::fs::write(root.join(format!("{i:04}-{}", "x".repeat(90))), "").unwrap();
+        }
+        let snap = status(root.to_str().unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(snap.outcome, VcsOutcome::Ready);
+        assert!(snap.dirty);
+    }
+
+    #[test]
+    fn gone_upstream_is_not_in_sync() {
+        let snap = parse_status(b"## main...origin/main [gone]\0");
+        assert!(snap.upstream_gone);
+        let old: VcsSnapshot = serde_json::from_str(r#"{"outcome":"ready"}"#).unwrap();
+        assert!(!old.upstream_gone);
+    }
+
+    #[test]
+    fn status_keeps_conflicts_beyond_the_output_cap() {
+        let mut bytes = b"## main\0".to_vec();
+        for _ in 0..10_000 {
+            bytes.extend_from_slice(b" M changed-file\0");
+        }
+        bytes.extend_from_slice(b"UU conflict\0");
+        let snap = parse_status(&bytes);
+        assert!(snap.conflicts);
     }
 }

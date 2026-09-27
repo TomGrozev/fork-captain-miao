@@ -108,10 +108,22 @@ pub enum ClientFrame {
     /// Version-control status of `cwd`. Reply: `VcsStatus`. Pulled, not pushed:
     /// the dashboard asks while it is showing the answer.
     GetVcsStatus { req_id: u64, cwd: String },
-    /// Publish the current branch or bookmark. No force. Reply: `VcsCommandDone`.
+    /// Legacy request; current servers refuse it because it lacks a confirmed target.
     VcsPush { req_id: u64, cwd: String },
-    /// Take remote changes without creating a local commit. Reply: `VcsCommandDone`.
+    /// Legacy request; current servers refuse it because it lacks a confirmed target.
     VcsPull { req_id: u64, cwd: String },
+    /// Resolve an immutable command target before asking for confirmation.
+    PrepareVcs {
+        req_id: u64,
+        cwd: String,
+        push: bool,
+    },
+    /// Execute only if the confirmed checkout and destination still match.
+    RunVcs {
+        req_id: u64,
+        cwd: String,
+        plan: Box<crate::vcs::VcsPlan>,
+    },
     /// A frame this build doesn't know — a *newer* peer's addition. Decoded
     /// rather than erroring, so the connection survives; the handler ignores it.
     #[serde(other)]
@@ -206,6 +218,11 @@ pub enum ServerFrame {
         ok: bool,
         message: String,
     },
+    VcsPrepared {
+        req_id: u64,
+        plan: Option<Box<crate::vcs::VcsPlan>>,
+        error: Option<String>,
+    },
     /// A frame this build doesn't know — see [`ClientFrame::Unknown`].
     #[serde(other)]
     Unknown,
@@ -228,6 +245,7 @@ impl ServerFrame {
             | ServerFrame::DirChecked { req_id, .. }
             | ServerFrame::Vitals { req_id, .. }
             | ServerFrame::VcsStatus { req_id, .. }
+            | ServerFrame::VcsPrepared { req_id, .. }
             | ServerFrame::VcsCommandDone { req_id, .. } => Some(*req_id),
             ServerFrame::CodexConfig { req_id, .. } => Some(*req_id),
             ServerFrame::Welcome { .. }
@@ -300,6 +318,16 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
             },
             ClientFrame::Subscribe,
+            ClientFrame::PrepareVcs {
+                req_id: 10,
+                cwd: "~/project".into(),
+                push: true,
+            },
+            ClientFrame::RunVcs {
+                req_id: 11,
+                cwd: "~/project".into(),
+                plan: Box::new(crate::vcs::VcsPlan::for_test(true)),
+            },
             ClientFrame::ListResumable {
                 req_id: 7,
                 limit: 50,

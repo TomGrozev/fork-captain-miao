@@ -125,6 +125,12 @@ struct LoopInboxes {
 }
 
 enum VcsMsg {
+    Prepared {
+        host: HostId,
+        cwd: String,
+        seq: u64,
+        result: Result<Box<cm_core::vcs::VcsPlan>, String>,
+    },
     Status {
         host: HostId,
         cwd: String,
@@ -178,10 +184,92 @@ enum RemoteReach {
 
 fn remote_reach(app: &App, host: &HostId) -> RemoteReach {
     match app.backend_for(host) {
-        Some(Backend::Local(_)) | None => RemoteReach::Local,
+        Some(Backend::Local(_)) => RemoteReach::Local,
+        None => RemoteReach::Down,
         Some(backend) if !backend.conn_state().is_connected() => RemoteReach::Down,
         Some(Backend::Remote(backend)) => RemoteReach::Up(std::sync::Arc::clone(backend)),
     }
+}
+
+async fn read_vcs(remote: RemoteReach, cwd: String) -> Option<cm_core::vcs::VcsSnapshot> {
+    let deadline = Instant::now() + cm_core::vcs::STATUS_LIMIT;
+    match remote {
+        RemoteReach::Down => None,
+        RemoteReach::Up(remote) => match remote
+            .request_within(VCS_RPC_TIMEOUT, |req_id| {
+                cm_core::protocol::ClientFrame::GetVcsStatus { req_id, cwd }
+            })
+            .await
+        {
+            Some(cm_core::protocol::ServerFrame::VcsStatus { snapshot, .. }) => Some(snapshot),
+            _ => None,
+        },
+        RemoteReach::Local => Some(
+            tokio::task::spawn_blocking(move || cm_core::vcs::status_with_deadline(&cwd, deadline))
+                .await
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+fn prepare_vcs_command(
+    app: &mut App,
+    tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>,
+    host: HostId,
+    cwd: String,
+    push: bool,
+    seq: u64,
+) {
+    let remote = remote_reach(app, &host);
+    app.set_status("reading checkout…".to_string(), false);
+    let tx = tx.clone();
+    let deadline = Instant::now() + cm_core::vcs::COMMAND_LIMIT;
+    tokio::spawn(async move {
+        let result = match remote {
+            RemoteReach::Down => Err("disconnected".to_string()),
+            RemoteReach::Local => {
+                let work_cwd = cwd.clone();
+                tokio::task::spawn_blocking(move || {
+                    cm_core::vcs::prepare(&work_cwd, push, deadline)
+                })
+                .await
+                .unwrap_or_else(|_| Err("git failed".into()))
+                .map(Box::new)
+            }
+            RemoteReach::Up(remote) => {
+                match remote
+                    .request_within(VCS_COMMAND_TIMEOUT, |req_id| {
+                        cm_core::protocol::ClientFrame::PrepareVcs {
+                            req_id,
+                            cwd: cwd.clone(),
+                            push,
+                        }
+                    })
+                    .await
+                {
+                    Some(cm_core::protocol::ServerFrame::VcsPrepared {
+                        plan: Some(plan),
+                        error: None,
+                        ..
+                    }) => Ok(plan),
+                    Some(cm_core::protocol::ServerFrame::VcsPrepared {
+                        error: Some(error),
+                        ..
+                    }) => Err(error),
+                    _ => Err(
+                        "host did not prepare the command; check its connection and server version"
+                            .into(),
+                    ),
+                }
+            }
+        };
+        let _ = tx.send(VcsMsg::Prepared {
+            host,
+            cwd,
+            seq,
+            result,
+        });
+    });
 }
 
 /// Ask for the selected checkout's status while the detail panel can show it.
@@ -208,7 +296,7 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
         slot.inflight = true;
     }
     let remote = match remote_reach(app, &host) {
-        RemoteReach::Up(backend) => Some(backend),
+        RemoteReach::Up(backend) => RemoteReach::Up(backend),
         RemoteReach::Down => {
             if let Some(slot) = app.vcs.get_mut(&(host, cwd)) {
                 slot.view = super::VcsView::Unavailable;
@@ -216,28 +304,12 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
             }
             return;
         }
-        RemoteReach::Local => None,
+        RemoteReach::Local => RemoteReach::Local,
     };
     let report_cwd = cwd.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let snapshot = if let Some(remote) = remote {
-            match remote
-                .request_within(VCS_RPC_TIMEOUT, |req_id| {
-                    cm_core::protocol::ClientFrame::GetVcsStatus { req_id, cwd }
-                })
-                .await
-            {
-                Some(cm_core::protocol::ServerFrame::VcsStatus { snapshot, .. }) => Some(snapshot),
-                _ => None,
-            }
-        } else {
-            Some(
-                tokio::task::spawn_blocking(move || cm_core::vcs::status(&cwd))
-                    .await
-                    .unwrap_or_default(),
-            )
-        };
+        let snapshot = read_vcs(remote, cwd).await;
         let _ = tx.send(VcsMsg::Status {
             host,
             cwd: report_cwd,
@@ -248,6 +320,30 @@ fn poll_vcs(app: &mut App, tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>) {
 
 fn apply_vcs(app: &mut App, msg: VcsMsg) {
     match msg {
+        VcsMsg::Prepared {
+            host,
+            cwd,
+            seq,
+            result,
+        } => {
+            if seq != app.vcs_prepare_seq
+                || app.input_mode != InputMode::Normal
+                || app.session_detail
+                || !app
+                    .selected_session_ref()
+                    .is_some_and(|s| s.host == host && s.cwd == cwd)
+            {
+                return;
+            }
+            if matches!(remote_reach(app, &host), RemoteReach::Down) {
+                app.set_status("disconnected".to_string(), true);
+                return;
+            }
+            match result {
+                Ok(plan) => app.confirm_vcs(plan),
+                Err(error) => app.set_status(error, true),
+            }
+        }
         VcsMsg::Status {
             host,
             cwd,
@@ -280,7 +376,7 @@ fn start_vcs_command(
     tx: &tokio::sync::mpsc::UnboundedSender<VcsMsg>,
     host: HostId,
     cwd: String,
-    push: bool,
+    plan: Box<cm_core::vcs::VcsPlan>,
 ) {
     let remote = match remote_reach(app, &host) {
         RemoteReach::Up(backend) => Some(backend),
@@ -291,7 +387,7 @@ fn start_vcs_command(
         RemoteReach::Local => None,
     };
     app.set_status(
-        if push {
+        if plan.push {
             "pushing…".to_string()
         } else {
             "pulling…".to_string()
@@ -300,20 +396,15 @@ fn start_vcs_command(
     );
     let report_cwd = cwd.clone();
     let tx = tx.clone();
+    let deadline = Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
         let (ok, message) = if let Some(remote) = remote {
             let reply = remote
                 .request_within(VCS_COMMAND_TIMEOUT, |req_id| {
-                    if push {
-                        cm_core::protocol::ClientFrame::VcsPush {
-                            req_id,
-                            cwd: cwd.clone(),
-                        }
-                    } else {
-                        cm_core::protocol::ClientFrame::VcsPull {
-                            req_id,
-                            cwd: cwd.clone(),
-                        }
+                    cm_core::protocol::ClientFrame::RunVcs {
+                        req_id,
+                        cwd: cwd.clone(),
+                        plan,
                     }
                 })
                 .await;
@@ -321,17 +412,14 @@ fn start_vcs_command(
                 Some(cm_core::protocol::ServerFrame::VcsCommandDone { ok, message, .. }) => {
                     (ok, message)
                 }
-                _ => (false, "no answer from the host".to_string()),
+                _ => (
+                    false,
+                    "no answer from the host; outcome unknown — verify before retrying".to_string(),
+                ),
             }
         } else {
-            match tokio::task::spawn_blocking(move || {
-                if push {
-                    cm_core::vcs::push(&cwd)
-                } else {
-                    cm_core::vcs::pull(&cwd)
-                }
-            })
-            .await
+            match tokio::task::spawn_blocking(move || cm_core::vcs::execute(&cwd, &plan, deadline))
+                .await
             {
                 Ok(Ok(message)) => (true, message),
                 Ok(Err(message)) => (false, message),
@@ -2860,8 +2948,16 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                     Action::GrantConsent(reply) => {
                         let _ = reply.send(true);
                     }
-                    Action::VcsRun { host, cwd, push } => {
-                        start_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push);
+                    Action::VcsPrepare {
+                        host,
+                        cwd,
+                        push,
+                        seq,
+                    } => {
+                        prepare_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, push, seq);
+                    }
+                    Action::VcsRun { host, cwd, plan } => {
+                        start_vcs_command(&mut app, &inboxes.vcs_tx, host, cwd, plan);
                     }
                     Action::CopySessionId(sid) => {
                         match copy_to_clipboard(&sid) {
@@ -2929,6 +3025,101 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vcs_app() -> App {
+        let mut app = App::new();
+        app.detail_visible = false;
+        let mut session = crate::state::LauncherState::for_test(
+            AgentControl::Claude,
+            crate::state::SessionStatus::Idle,
+        );
+        session.cwd = "/tmp/checkout".to_string();
+        app.sessions = vec![session];
+        app.mark_dirty(super::super::Cursor::HoldIndex);
+        app.table_state.select(Some(0));
+        app
+    }
+
+    #[tokio::test]
+    async fn command_preparation_reads_with_hidden_details() {
+        let root = std::env::temp_dir().join(format!("cm-vcs-hidden-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for args in [
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            vec!["remote", "add", "origin", "."],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let mut app = vcs_app();
+        let cwd = root.to_string_lossy().into_owned();
+        app.sessions[0].cwd = cwd.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        prepare_vcs_command(&mut app, &tx, HostId::local(), cwd, true, 0);
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        apply_vcs(&mut app, message);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(app.pending_confirm.is_some());
+        assert_eq!(app.input_mode, InputMode::Confirm);
+    }
+
+    #[test]
+    fn late_preparation_cannot_interrupt_new_input_or_selection() {
+        for changed_selection in [false, true] {
+            let mut app = vcs_app();
+            if changed_selection {
+                app.sessions[0].cwd = "/tmp/elsewhere".into();
+            } else {
+                app.vcs_prepare_seq += 1;
+            }
+            apply_vcs(
+                &mut app,
+                VcsMsg::Prepared {
+                    host: HostId::local(),
+                    cwd: "/tmp/checkout".into(),
+                    seq: 0,
+                    result: Ok(Box::new(cm_core::vcs::VcsPlan::for_test(true))),
+                },
+            );
+            assert!(app.pending_confirm.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_remote_never_resolves_to_local() {
+        let app = App::new();
+        assert!(matches!(
+            remote_reach(&app, &HostId("removed-host".into())),
+            RemoteReach::Down
+        ));
+    }
 
     #[test]
     fn detach_prune_floor() {

@@ -40,7 +40,7 @@ path = "src/main.rs"
 # Shared logic (state, protocol, agents, launcher, hooks) lives in `cm-core`.
 [dependencies]
 cm-core = { path = "crates/cm-core" }
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
 serde = { version = "1", features = ["derive"] }

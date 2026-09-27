@@ -7306,6 +7306,73 @@ fn a_connected_host_shows_its_sessions_while_another_still_loads() {
 // =============================================================================
 
 #[test]
+fn vcs_commands_request_status_when_details_are_hidden() {
+    let mut d = TestDashboard::new(120, 30);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = false;
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    for key in ['p', 'l'] {
+        d.press(KeyCode::Char(' '));
+        d.press(KeyCode::Char('v'));
+        let action = d.press(KeyCode::Char(key));
+        assert_eq!(action.as_ref().map(Action::name), Some("VcsPrepare"));
+        assert!(d.app.pending_confirm.is_none());
+    }
+}
+
+#[test]
+fn checked_pull_confirmation_fits_a_small_terminal() {
+    let mut d = TestDashboard::new(40, 18);
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    d.app
+        .confirm_vcs(Box::new(cm_core::vcs::VcsPlan::for_test(false)));
+    let out = d.render();
+    assert!(out.contains("origin/main"), "{out}");
+    assert!(out.contains("aaaaaaaaaaaa"), "{out}");
+    assert!(out.contains("bbbbbbbbbbbb"), "{out}");
+    assert!(out.contains("cancel"), "{out}");
+}
+
+#[test]
+fn gone_upstream_warns_and_offers_republication() {
+    let mut d = TestDashboard::new(160, 30);
+    d.app.panels_initialized = true;
+    d.app.detail_visible = true;
+    d.app.preview_visible = false;
+    d.set_sessions(vec![session(1, "/tmp/project", SessionStatus::Idle)]);
+    let snap = cm_core::vcs::VcsSnapshot {
+        outcome: cm_core::vcs::VcsOutcome::Ready,
+        head: Some("main".into()),
+        upstream: Some("origin/main".into()),
+        upstream_gone: true,
+        ..Default::default()
+    };
+    d.app.vcs.insert(
+        (
+            d.app.sessions[0].host.clone(),
+            d.app.sessions[0].cwd.clone(),
+        ),
+        super::VcsSlot {
+            view: super::VcsView::Snapshot(snap),
+            ..Default::default()
+        },
+    );
+    let out = d.render();
+    assert!(out.contains("upstream gone"), "{out}");
+    assert!(!out.contains('✓'), "{out}");
+    d.app
+        .confirm_vcs(Box::new(cm_core::vcs::VcsPlan::for_test(true)));
+    assert!(
+        d.app
+            .pending_confirm
+            .as_ref()
+            .unwrap()
+            .prompt
+            .contains("to origin/main")
+    );
+}
+
+#[test]
 fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
     let mut d = TestDashboard::new(160, 40);
     d.app.panels_initialized = true;
@@ -7427,10 +7494,18 @@ fn space_v_p_asks_before_pushing_and_the_detail_panel_shows_the_checkout() {
 
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Char('v'));
-    d.press(KeyCode::Char('p'));
+    let prepare = d.press(KeyCode::Char('p'));
+    assert!(matches!(
+        prepare,
+        Some(Action::VcsPrepare { push: true, .. })
+    ));
+    assert!(d.app.pending_confirm.is_none());
+    // The event loop supplies a fresh read before opening this confirmation.
+    d.app
+        .confirm_vcs(Box::new(cm_core::vcs::VcsPlan::for_test(true)));
     let confirm = d.app.pending_confirm.expect("push asks first");
     assert!(confirm.prompt.contains("origin/main"), "{}", confirm.prompt);
-    assert!(matches!(confirm.action, Action::VcsRun { push: true, .. }));
+    assert!(matches!(confirm.action, Action::VcsRun { plan, .. } if plan.push));
     // Drop the confirm so the next render is the detail panel again.
     d.app.pending_confirm = None;
     d.app.input_mode = InputMode::Normal;
@@ -7508,6 +7583,26 @@ fn space_t_s_opens_the_session_record() {
     d.press(KeyCode::Char('q'));
     assert!(!d.app.session_detail);
     assert!(!d.app.should_quit);
+}
+
+#[test]
+fn session_record_end_reaches_wrapped_fields() {
+    let mut d = TestDashboard::new(40, 18);
+    d.app.panels_initialized = true;
+    d.app.preview_visible = false;
+    let mut s = session(1, "/tmp/project", SessionStatus::Idle);
+    s.child_pid = Some(4242);
+    s.first_prompt = Some("record-sentinel".into());
+    s.terminfo = Some("xterm-256color".into());
+    d.app.terminfo = Some("xterm-kitty".into());
+    d.set_sessions(vec![s]);
+    d.press_toggle('s');
+    d.press(KeyCode::End);
+    let out = d.render();
+    assert!(out.contains("record-sentinel"), "{out}");
+    assert!(d.app.session_detail_scroll > 0);
+    d.press(KeyCode::Home);
+    assert!(d.render().contains("4242"));
 }
 
 #[test]
