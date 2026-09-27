@@ -319,15 +319,67 @@ pub fn session_flags_path() -> PathBuf {
 // Process utilities
 // =============================================================================
 
-/// Whether a pid is still running, by `kill(pid, 0)`. Used wherever a recorded
+/// Whether a pid is still running, excluding exited but unreaped children.
+/// `kill(pid, 0)` alone also succeeds for zombies. Used wherever a recorded
 /// pid has to be re-checked rather than trusted — a stale state file, a pool
 /// name whose launcher died, a snapshot from a previous dashboard.
 pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     // `kill(pid, 0)` returns 0 when the signal could be sent, but -1/EPERM
     // when the process exists yet is owned by another user. Treat EPERM as
     // alive so we never delete or "restart" a live session's state.
     let r = unsafe { libc::kill(pid as i32, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+        return false;
+    }
+    !process_has_exited(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn process_has_exited(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: the buffer has the size and alignment required by this flavor.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read == size {
+        // SAFETY: a complete result initializes every field we read.
+        return unsafe { info.assume_init() }.pbi_status == libc::SZOMB;
+    }
+    // macOS excludes zombies from this query and returns ESRCH for them, as
+    // it does for a process reaped between our probes. Permission errors and
+    // incomplete results are unknown, never evidence to discard a live row.
+    read <= 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_exited(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .is_some_and(|stat| proc_stat_has_exited(&stat))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn proc_stat_has_exited(stat: &str) -> bool {
+    // comm may itself contain whitespace or parentheses; state follows its
+    // final closing parenthesis. Preserve rows on unreadable/malformed input.
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_ascii_whitespace().next())
+        .is_some_and(|status| matches!(status, "Z" | "X" | "x"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_has_exited(_pid: u32) -> bool {
+    false
 }
 
 // =============================================================================
@@ -1597,8 +1649,11 @@ fn drain_detach_reports_in(dir: &Path) -> Vec<DetachReport> {
 /// remote dashboard's `Snapshot`. An unreadable or unparseable file is skipped
 /// rather than failing the sweep.
 pub fn read_all_launcher_states() -> Vec<LauncherState> {
-    let dir = sessions_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    read_launcher_states_in(&sessions_dir())
+}
+
+fn read_launcher_states_in(dir: &Path) -> Vec<LauncherState> {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
@@ -1637,6 +1692,86 @@ pub fn read_all_launcher_states() -> Vec<LauncherState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_stat_distinguishes_exited_from_stopped_or_unknown() {
+        for status in ["Z", "X", "x"] {
+            assert!(proc_stat_has_exited(&format!(
+                "42 (agent (with) spaces)) {status} 1 42"
+            )));
+        }
+        for stat in [
+            "42 (agent) R 1",
+            "42 (agent) S 1",
+            "42 (agent) T 1",
+            "",
+            "42 (agent)",
+            "42",
+        ] {
+            assert!(!proc_stat_has_exited(stat));
+        }
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(u32::MAX));
+    }
+
+    #[test]
+    fn session_scan_removes_zombies_without_reaping_them() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let mut child = Child(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let dir = std::env::temp_dir().join(format!("cm-zombie-{}-{pid}", std::process::id()));
+        create_dir_all_private(&dir).unwrap();
+        let path = dir.join(format!("{pid}.json"));
+        let row = LauncherState {
+            launcher_pid: pid,
+            ..LauncherState::for_test(crate::agent::AgentControl::Codex, SessionStatus::Active)
+        };
+        write_json_atomic(&path, &row).unwrap();
+        assert_eq!(read_launcher_states_in(&dir).len(), 1);
+
+        child.0.kill().unwrap();
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // SAFETY: this is our child, and waitid initializes the supplied buffer.
+        // WNOWAIT leaves the exited child unreaped, as a terminal can do.
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0
+        );
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+        let rows = read_launcher_states_in(&dir);
+        let retained_file = path.exists();
+        // The scan must not steal the process owner's wait status.
+        assert!(child.0.wait().is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            rows.is_empty(),
+            "an exited launcher's active row survived the scan"
+        );
+        assert!(
+            !retained_file,
+            "the zombie launcher's state file was retained"
+        );
+        assert!(is_process_alive(std::process::id()));
+    }
 
     #[test]
     fn codex_reattach_restores_input_on_the_primary_screen() {

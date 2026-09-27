@@ -60,6 +60,14 @@ pub async fn run(
     launch_id: Option<String>,
     shims: ClipboardShims,
 ) -> Result<()> {
+    // Ctrl-C reaches both processes in the terminal's foreground group. Catch
+    // it in the launcher so only the agent decides whether to interrupt a turn
+    // or exit; the default action would kill us without removing session state.
+    // Install before spawning. A caught handler resets on exec, unlike SIG_IGN,
+    // so the agent retains its own interrupt behavior. Do not forward it again.
+    let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("Failed to install launcher interrupt handler")?;
+
     state::ensure_sessions_dir()?;
 
     let launcher_pid = std::process::id();
@@ -335,9 +343,8 @@ pub async fn run(
         // the window/tab hosting it, or a `kill`). The signal's default action
         // would kill us without unwinding, so the `CleanupGuard` Drop never runs
         // and we'd leak the state file, socket, and settings file. Catch it,
-        // kill the now-orphaned agent, clean up explicitly, and exit. (SIGINT is
-        // deliberately *not* caught — Ctrl-C belongs to the agent's own
-        // interrupt handling, not to tearing down the session.)
+        // kill the now-orphaned agent, clean up explicitly, and exit. SIGINT is
+        // caught separately above; it belongs to the agent's interrupt handling.
         _ = wait_for_termination_signal() => {
             tracing::info!("Launcher received termination signal; cleaning up");
             let _ = child.start_kill();

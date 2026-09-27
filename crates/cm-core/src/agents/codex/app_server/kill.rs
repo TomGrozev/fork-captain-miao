@@ -156,17 +156,6 @@ fn signal_kill(pid: u32) -> Result<()> {
 fn wait_for_exit(pid: u32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while state::is_process_alive(pid) {
-        // An exited process can await its parent's waitpid briefly. We must
-        // not reap a child owned by the terminal/pool's existing wait loop.
-        let zombie = std::process::Command::new("ps")
-            .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output()
-            .is_ok_and(|out| {
-                out.status.success() && out.stdout.trim_ascii_start().starts_with(b"Z")
-            });
-        if zombie {
-            return Ok(());
-        }
         anyhow::ensure!(
             Instant::now() < deadline,
             "Codex process did not exit after forced cleanup"

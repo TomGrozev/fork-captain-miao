@@ -12,6 +12,40 @@ use serde_json::json;
 use support::{CodexServer, Host, Peer, WAIT, until};
 
 #[tokio::test]
+async fn native_launcher_survives_ctrl_c_until_its_agent_exits() {
+    let mut host = Host::new();
+    let launcher = host.launch("native", false);
+    until("native agent ready", || {
+        host.launcher_state(launcher)
+            .is_some_and(|s| s.status == SessionStatus::Idle)
+    })
+    .await;
+    let agent = host.launcher_state(launcher).unwrap().child_pid.unwrap();
+
+    // Like terminal Ctrl-C, interrupt both members of the foreground group.
+    // The fixture reports its first interrupt through a real agent hook.
+    assert_eq!(unsafe { libc::kill(-(launcher as i32), libc::SIGINT) }, 0);
+    until("agent handles interrupt", || {
+        host.assert_alive(&[launcher]);
+        host.launcher_state(launcher)
+            .is_some_and(|s| s.status == SessionStatus::Active)
+    })
+    .await;
+    host.assert_alive(&[launcher]);
+    assert!(cm_core::state::is_process_alive(agent));
+
+    // The second interrupt exits the fixture, as an agent may choose to do.
+    assert_eq!(unsafe { libc::kill(-(launcher as i32), libc::SIGINT) }, 0);
+    until("launcher removes its state", || {
+        host.launcher_state(launcher).is_none()
+    })
+    .await;
+    host.wait_exited(launcher).await;
+    assert!(!cm_core::state::is_process_alive(agent));
+    assert!(host.launcher_sockets_gone());
+}
+
+#[tokio::test]
 async fn sessions_recover_and_remain_controllable_across_connection_and_cleanup_failures() {
     let mut host = Host::new();
     let mut codex = CodexServer::start(host.codex_socket()).await;
@@ -322,7 +356,12 @@ async fn codex_fixture() {
     let endpoint = std::env::var("CM_LIFECYCLE_RELAY").unwrap();
     if endpoint.is_empty() {
         use std::io::Write;
-        for event in ["session-start", "stop"] {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt()).unwrap();
+        for event in ["session-start", "stop", "prompt-submit"] {
+            if event == "prompt-submit" {
+                interrupt.recv().await.unwrap();
+            }
             let mut hook = std::process::Command::new(env!("CARGO_BIN_EXE_miao-server"))
                 .args(["hook", event, "--agent", "codex"])
                 .stdin(std::process::Stdio::piped())
@@ -335,7 +374,8 @@ async fn codex_fixture() {
                 .unwrap();
             assert!(hook.wait().unwrap().success());
         }
-        std::future::pending::<()>().await;
+        interrupt.recv().await.unwrap();
+        return;
     }
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

@@ -2,6 +2,7 @@
 //! RPC arrivals synchronize the scenario; deadlines only bound a broken test.
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -136,6 +137,7 @@ exec {} --exact codex_fixture --nocapture
         let mut command = self.command();
         command
             .args(["launch", "codex"])
+            .process_group(0)
             .arg(&cwd)
             .args(["resume", id])
             .env("CM_LIFECYCLE_THREAD", id)
@@ -168,6 +170,14 @@ exec {} --exact codex_fixture --nocapture
         }
     }
 
+    pub fn launcher_state(&self, pid: u32) -> Option<LauncherState> {
+        let path = self
+            .root
+            .path()
+            .join(format!("state/captain-miao/sessions/{pid}.json"));
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
     pub async fn wait_exited(&mut self, pid: u32) {
         let child = self
             .launchers
@@ -196,26 +206,12 @@ impl Drop for Host {
                 }
             }
         }
-        // On assertion failure, reap only children belonging to our launchers.
-        // Fixtures have no grandchildren or model/tool processes.
+        // Each launcher owns an isolated process group. Kill its fixture even
+        // if the launcher exited first and the daemon already removed its row.
         for child in &mut self.launchers {
-            if child.try_wait().ok().flatten().is_some() {
-                continue;
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-            let file = self
-                .root
-                .path()
-                .join(format!("state/captain-miao/sessions/{}.json", child.id()));
-            if let Ok(bytes) = std::fs::read(file)
-                && let Ok(row) = serde_json::from_slice::<LauncherState>(&bytes)
-                && row.launcher_pid == child.id()
-                && let Some(pid) = row.child_pid
-            {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-            let _ = child.kill();
             let _ = child.wait();
         }
         let _ = self.command().args(["daemon", "stop", "--force"]).status();
