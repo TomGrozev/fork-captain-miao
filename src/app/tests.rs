@@ -6380,8 +6380,14 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
     d.press(KeyCode::Tab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::ShellCommand)
+    );
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::Label)
     );
+    d.press(KeyCode::BackTab);
     d.press(KeyCode::BackTab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
@@ -6570,6 +6576,100 @@ fn forwarding_configuration_does_not_replace_a_hosts_connection() {
 }
 
 #[test]
+fn work_tab_command_edits_apply_without_replacing_the_connection() {
+    use super::hosts::HostConfig;
+    let host = HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        ..Default::default()
+    };
+    let old = App::dialled_identities(std::slice::from_ref(&host), &Default::default());
+    let changed = HostConfig {
+        shell_command: Some("zellij".into()),
+        ..host
+    };
+    let new = App::dialled_identities(&[changed], &Default::default());
+    assert_eq!(App::plan_reconcile(&old, &new), vec![Some(0)]);
+}
+
+#[test]
+fn work_tab_command_editor_saves_cancels_and_clears_the_optional_setting() {
+    use super::HostField;
+    use super::hosts::HostConfig;
+    use crate::state::HostId;
+
+    let mut d = TestDashboard::new(120, 36);
+    d.app.open_host_edit_from(vec![HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        disabled: true,
+        shell_command: Some("tmux".into()),
+        ..Default::default()
+    }]);
+    let panel = d.app.host_edit.as_mut().unwrap();
+    panel.cursor = 1;
+    panel.begin_edit(HostField::ShellCommand);
+    assert!(d.render().contains("Work tab command"));
+    assert!(d.render().contains("tmux"));
+    d.press_ctrl(KeyCode::Char('u'));
+    for ch in "zellij".chars() {
+        d.press(KeyCode::Char(ch));
+    }
+    d.press(KeyCode::Esc);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[1]
+            .shell_command
+            .text(),
+        "tmux"
+    );
+
+    d.app
+        .host_edit
+        .as_mut()
+        .unwrap()
+        .begin_edit(HostField::ShellCommand);
+    d.press_ctrl(KeyCode::Char('u'));
+    for ch in "zellij".chars() {
+        d.press(KeyCode::Char(ch));
+    }
+    d.press(KeyCode::Enter);
+    let command = d.app.host_edit.as_ref().unwrap().rows[1]
+        .config()
+        .unwrap()
+        .shell_command;
+    assert_eq!(command.as_deref(), Some("zellij"));
+    assert_eq!(
+        d.app
+            .host_shell_commands
+            .get(&HostId("example".into()))
+            .map(String::as_str),
+        Some("zellij")
+    );
+
+    d.app
+        .host_edit
+        .as_mut()
+        .unwrap()
+        .begin_edit(HostField::ShellCommand);
+    d.press_ctrl(KeyCode::Char('u'));
+    d.press(KeyCode::Char(' '));
+    assert!(d.render().contains("(default shell)"));
+    d.press(KeyCode::Enter);
+    assert!(
+        d.app.host_edit.as_ref().unwrap().rows[1]
+            .config()
+            .unwrap()
+            .shell_command
+            .is_none()
+    );
+    assert!(
+        !d.app
+            .host_shell_commands
+            .contains_key(&HostId("example".into()))
+    );
+}
+
+#[test]
 fn forwarding_manager_respects_modal_ownership_and_saved_host_edits() {
     use super::hosts::HostConfig;
     let mut d = TestDashboard::new(120, 36);
@@ -6633,6 +6733,7 @@ fn forwarding_list_scrolls_and_socket_hosts_hide_ssh_controls() {
     let rendered = d.render();
     assert!(!rendered.contains("Advanced SSH options"));
     assert!(!rendered.contains("Port forwards"));
+    assert!(!rendered.contains("Work tab command"));
 }
 
 /// A host offered the clipboard says so on its row.
@@ -6771,8 +6872,8 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     let out = d.render();
     assert!(out.contains("Edit Host"), "the card names itself: {out}");
     assert!(
-        out.contains("h7"),
-        "and costs the list none of its rows: {out}"
+        out.contains("h1"),
+        "the list remains behind the taller card: {out}"
     );
     let card = out
         .lines()
@@ -6790,7 +6891,7 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
         let (x, y) = find_cell(buf, needle).unwrap_or_else(|| panic!("{needle} not drawn"));
         buf[(x, y)].style().add_modifier.contains(Modifier::DIM)
     };
-    assert!(dim_at("h7"), "the list must read as no longer listening");
+    assert!(dim_at("h1"), "the list must read as no longer listening");
     assert!(!dim_at("Edit Host"), "the card itself must not");
 
     // The line the card holds for a per-field hint is held whether the focused
@@ -6816,6 +6917,10 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     // A row the edit *created* says so, because there `Esc` drops it rather than
     // putting it back — the inline form had nowhere to tell you that.
     d.press(KeyCode::Esc);
+    assert!(
+        d.render().contains("h7"),
+        "closing the card restores the full list"
+    );
     d.press(KeyCode::Char('a'));
     let out = d.render();
     assert!(out.contains("Add Host"), "{out}");
@@ -6929,10 +7034,14 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
     assert_eq!(focus(&d), Some(Icon));
     d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(Clipboard));
+    d.press(KeyCode::Tab);
+    assert_eq!(focus(&d), Some(ShellCommand));
     // The form is a ring, so the last field steps to the first.
     d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(Label));
 
+    d.press(KeyCode::BackTab);
+    assert_eq!(focus(&d), Some(ShellCommand));
     d.press(KeyCode::BackTab);
     assert_eq!(focus(&d), Some(Clipboard));
     d.press(KeyCode::Up);
@@ -9275,6 +9384,7 @@ fn only_a_changed_connection_string_reconnects() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard: false,
+        shell_command: None,
     };
     let none = HashSet::new();
     let ids = |hosts: &[HostConfig]| App::dialled_identities(hosts, &none);
@@ -9296,6 +9406,7 @@ fn only_a_changed_connection_string_reconnects() {
             options: Vec::new(),
             forwards: Vec::new(),
             clipboard: false,
+            shell_command: None,
         }])
     );
     // A port forward is part of the ssh child's argv, so changing the set has to
@@ -9361,6 +9472,7 @@ fn reconciling_hosts_touches_only_the_hosts_that_changed() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard: false,
+        shell_command: None,
     };
     let none = HashSet::new();
     let live = App::dialled_identities(&[host("a", "user@a"), host("b", "user@b")], &none);
@@ -9408,6 +9520,7 @@ fn the_clipboard_server_runs_only_when_a_host_wants_it() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard,
+        shell_command: None,
     };
     assert!(!App::any_host_wants_clipboard(&[]));
     assert!(!App::any_host_wants_clipboard(&[host(false, false, None)]));

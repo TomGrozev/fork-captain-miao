@@ -2794,7 +2794,12 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
                         let plan = app
                             .backend_for(&host)
                             .ok_or_else(|| anyhow::anyhow!("unknown host {}", host.0))
-                            .and_then(|b| b.shell_plan(&cwd));
+                            .and_then(|b| {
+                                b.shell_plan(
+                                    &cwd,
+                                    app.host_shell_commands.get(&host).map(String::as_str),
+                                )
+                            });
                         let (command, spawn_cwd) = match plan {
                             Ok(ShellPlan::InProcess { cwd: real }) => (SpawnCommand::Shell, real),
                             // The ssh child launches from the dashboard's own

@@ -49,6 +49,11 @@ pub(super) struct HostConfig {
     /// load; only connection options belong here.
     #[serde(default)]
     pub options: Vec<String>,
+    /// Command run in a new SSH work tab (`w`), before the default login shell.
+    /// Missing or blank keeps the ordinary shell. This is a dashboard setting,
+    /// independent of the daemon connection and pooled agent sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_command: Option<String>,
     #[serde(default)]
     pub forwards: Vec<crate::ssh_forward::Rule>,
     /// Offer this host the dashboard machine's clipboard, so an agent in a
@@ -146,6 +151,37 @@ pub(super) fn resolve_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_command_is_optional_and_round_trips_without_losing_quotes() {
+        for value in [
+            serde_json::json!({"label": "example", "ssh": "example-target"}),
+            serde_json::json!({"label": "example", "ssh": "example-target", "shell_command": null}),
+        ] {
+            let host: HostConfig = serde_json::from_value(value).unwrap();
+            assert!(host.shell_command.is_none());
+            assert!(
+                serde_json::to_value(host)
+                    .unwrap()
+                    .get("shell_command")
+                    .is_none()
+            );
+        }
+        for command in [
+            "",
+            " \t ",
+            "tmux new-session -A -s 'work session'",
+            "zellij",
+        ] {
+            let host: HostConfig = serde_json::from_value(serde_json::json!({
+                "label": "example", "ssh": "example-target", "shell_command": command,
+            }))
+            .unwrap();
+            let restored: HostConfig =
+                serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+            assert_eq!(restored.shell_command.as_deref(), Some(command));
+        }
+    }
 
     #[test]
     fn legacy_forward_migration_keeps_quoted_arguments_and_disabled_rules() {

@@ -714,12 +714,15 @@ different hosts indistinguishable to the app layer: `list_sessions`,
   The handle is drained on the loop's existing tick rather than awaited,
   because the main loop is crossterm-poll-driven; that is exactly where the old
   fs-event drain sat, so nothing got slower.
-- **Plans, not `Option`s.** `attach_plan(name, force)` and `shell_plan(cwd)`
+- **Plans, not `Option`s.** `attach_plan(name, force)` and
+  `shell_plan(cwd, shell_command)`
   return `Result`, so a host that can't do the thing *explains itself* instead
   of handing back a bare `None` the caller has to invent a message for.
   `shell_plan` answers `InProcess{cwd}` for this machine (including
   pooled-localhost, where the "remote" host is us) and `Spawn{argv}` for an ssh
-  host. `capabilities()` reports `{pooled, shell}`, and app code asks *"does
+  host. The optional command is a per-host dashboard preference, passed to
+  the SSH plan without changing connection identity or the wire protocol.
+  `capabilities()` reports `{pooled, shell}`, and app code asks *"does
   this host pool its sessions?"* rather than *"is this host local?"* — which is
   what makes `D` (detach) and the steal work identically under pooled-localhost.
 - **One binding token.** `LauncherState::binding_token()` — `pool_session`

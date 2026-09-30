@@ -1116,6 +1116,9 @@ pub(super) struct App {
     /// none configured falls back to a deterministic emoji derived from its
     /// label, so the column always reads as icons rather than truncated names.
     pub(super) host_icons: HashMap<HostId, String>,
+    /// Commands for new SSH work tabs. Kept outside connection identity so an
+    /// edit applies without replacing the host's live backend.
+    pub(super) host_shell_commands: HashMap<HostId, String>,
     /// Per-host recent-dir cache for the workdir picker, seeded at connect and
     /// invalidated when a launch records a new cwd. The picker is cache-first
     /// (§9): switching hosts must render instantly, and the rule the whole
@@ -1690,6 +1693,7 @@ impl App {
             foreign_bindings: Vec::new(),
             next_launch_id: 0,
             host_icons: HashMap::new(),
+            host_shell_commands: HashMap::new(),
             recent_dirs_cache: HashMap::new(),
             last_table_rect: None,
             last_preview_rect: None,
@@ -2665,6 +2669,14 @@ impl App {
         // Icons are display-only and belong to every configured host, suspended
         // ones included, so they are re-derived wholesale rather than reconciled.
         self.host_icons = Self::host_icons_from(hosts);
+        self.host_shell_commands = hosts
+            .iter()
+            .filter(|h| h.socket.is_none() && h.ssh.is_some())
+            .filter_map(|h| {
+                let command = h.shell_command.as_ref().filter(|c| !c.trim().is_empty())?;
+                Some((HostId(h.label.clone()), command.clone()))
+            })
+            .collect();
         let want = Self::dialled_identities(hosts, &self.upgrading);
         let plan = Self::plan_reconcile(&self.backend_identities, &want);
         // Lift the live remotes out into claimable slots. Draining from index 1
@@ -2769,6 +2781,7 @@ impl App {
                 clipboard: h.clipboard,
                 // Quote argv values so spaces survive reopening the editor.
                 options: picker::TextInput::with_text(shell_words::join(h.options)),
+                shell_command: picker::TextInput::with_text(h.shell_command.unwrap_or_default()),
                 forwards: h.forwards,
                 label: picker::TextInput::with_text(h.label),
                 ..HostRow::default()

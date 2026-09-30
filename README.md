@@ -505,6 +505,15 @@ default). `l` opens its full connection log, `c` suspends it, `u` upgrades its s
 - **Advanced SSH options** accepts quoted SSH arguments; machine setup normally
   belongs in `~/.ssh/config`. Changing these connection options can reconnect
   the host. The forwarding list manages ports independently.
+- **Work tab command** — edit an SSH host with `Space h` → `e` and set this
+  optional field to `tmux`, `zellij`, or a command with arguments. Pressing `w`
+  on one of that host's sessions opens a work tab in its directory and runs the
+  command in the remote user's interactive login environment. Missing, empty,
+  or whitespace-only `shell_command` opens the default user login shell.
+  When a command finishes, including on failure, the tab opens that shell;
+  errors stay visible. Pressing `w` on an existing work tab just focuses it.
+  Changes apply to new tabs without reconnecting the host. The setting lives
+  per host in `hosts.json` on the dashboard machine.
 - **Terminfo** — a host with no entry for your `TERM` is offered yours, so
   sessions there stop falling back to `xterm-256color`. It asks first.
 - **The daemon** is either your own on `PATH` or one the dashboard deploys.

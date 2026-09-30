@@ -1276,8 +1276,13 @@ impl Backend {
     }
 
     /// How to open an interactive login shell on this host in `cwd` (the `w`
-    /// work tab): in process for this machine, over ssh for a remote.
-    pub(crate) fn shell_plan(&self, cwd: &str) -> anyhow::Result<ShellPlan> {
+    /// work tab): in process for this machine, over ssh for a remote. An SSH
+    /// host may run a configured command first, in an interactive login shell.
+    pub(crate) fn shell_plan(
+        &self,
+        cwd: &str,
+        shell_command: Option<&str>,
+    ) -> anyhow::Result<ShellPlan> {
         match self {
             Backend::Local(h) => Ok(ShellPlan::InProcess {
                 // The row's cwd is host-canonical; a local chdir needs the real
@@ -1286,7 +1291,7 @@ impl Backend {
             }),
             Backend::Remote(b) => match b.attach_target.as_deref() {
                 Some(target) => Ok(ShellPlan::Spawn {
-                    argv: remote_shell_argv(target, &b.ssh_options, cwd),
+                    argv: remote_shell_argv(target, &b.ssh_options, cwd, shell_command),
                 }),
                 // Pooled localhost: the "remote" host is this machine, so the
                 // shell is the ordinary local one. `$HOME` never crosses the
@@ -2325,8 +2330,37 @@ fn resolve_local_attach_exe<'a>(
 /// **host-canonical** (§3), so a `~` form reaches the remote as a `"$HOME"` the
 /// login shell expands, where plain `'…'` quoting would render it inert. An
 /// empty `cwd` just drops the `cd`. Pure + unit-tested.
-fn remote_shell_argv(target: &str, options: &[String], cwd: &str) -> Vec<String> {
-    let remote_cmd = if cwd.is_empty() {
+///
+/// A configured command rides separately as $1 and runs in an interactive
+/// login shell, so PATH and interactive shell setup are available. Afterwards
+/// the ordinary shell opens, even on failure, keeping diagnostics visible.
+fn remote_shell_argv(
+    target: &str,
+    options: &[String],
+    cwd: &str,
+    shell_command: Option<&str>,
+) -> Vec<String> {
+    let shell_command = shell_command.filter(|command| !command.trim().is_empty());
+    let remote_cmd = if let Some(command) = shell_command {
+        let script = concat!(
+            "\"${SHELL:-/bin/sh}\" -l -i -c \"$1\"; ",
+            "status=$?; ",
+            "if [ \"$status\" -ne 0 ]; then ",
+            "echo \"Work tab command exited with status $status\" >&2; fi; ",
+            "exec \"${SHELL:-/bin/sh}\" -l"
+        );
+        let script = if cwd.is_empty() {
+            script.to_string()
+        } else {
+            format!("cd \"$0\" || exit; {script}")
+        };
+        format!(
+            "{} {} {}",
+            login_shell_safe(&script),
+            cm_core::paths::shell_quote_host_path(cwd),
+            login_shell_quote_arg(command)
+        )
+    } else if cwd.is_empty() {
         login_shell_safe("exec \"${SHELL:-/bin/sh}\" -l")
     } else {
         format!(
@@ -2340,6 +2374,22 @@ fn remote_shell_argv(target: &str, options: &[String], cwd: &str) -> Vec<String>
     argv.push(target.to_string());
     argv.push(remote_cmd);
     argv
+}
+
+/// Quote command text for the account's login shell without expanding it.
+/// Fish interprets backslashes inside single quotes, unlike POSIX shells, so
+/// quotes and backslashes each ride in their own double-quoted segment.
+fn login_shell_quote_arg(arg: &str) -> String {
+    let mut quoted = String::from("'");
+    for ch in arg.chars() {
+        match ch {
+            '\'' => quoted.push_str("'\"'\"'"),
+            '\\' => quoted.push_str("'\"\\\\\"'"),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Backoff bounds for reconnecting a dropped remote connection.
@@ -4237,7 +4287,7 @@ mod tests {
 
     #[test]
     fn remote_shell_argv_cds_and_execs_login_shell() {
-        let argv = remote_shell_argv("user@box", &[], "/home/u/proj");
+        let argv = remote_shell_argv("user@box", &[], "/home/u/proj", None);
         assert_eq!(
             ssh_tail(&argv),
             [
@@ -4249,7 +4299,7 @@ mod tests {
         // something the *remote* shell expands. Single-quoting it — the obvious
         // thing — would make `cd '~/proj'` fail on every host. It rides outside
         // the `sh -c` wrapper precisely so it can keep its quotes.
-        let argv = remote_shell_argv("box", &[], "~/proj");
+        let argv = remote_shell_argv("box", &[], "~/proj", None);
         assert_eq!(
             ssh_tail(&argv),
             [
@@ -4258,11 +4308,102 @@ mod tests {
             ]
         );
         // Empty cwd drops the `cd` and just opens a login shell.
-        let argv = remote_shell_argv("box", &[], "");
+        let argv = remote_shell_argv("box", &[], "", None);
         assert_eq!(
             ssh_tail(&argv),
             ["box", "/bin/sh -c 'exec \"${SHELL:-/bin/sh}\" -l'"]
         );
+    }
+
+    #[test]
+    fn remote_shell_argv_keeps_the_default_shell_for_blank_commands() {
+        for cwd in ["", "~/project", "/path/to/project"] {
+            let default = remote_shell_argv("box", &[], cwd, None);
+            for command in ["", " \t\n "] {
+                assert_eq!(remote_shell_argv("box", &[], cwd, Some(command)), default);
+            }
+        }
+    }
+
+    #[test]
+    fn remote_shell_command_runs_in_cwd_and_returns_to_the_default_shell() {
+        let root = std::env::temp_dir().join(format!("cm-work-shell-{}", std::process::id()));
+        let project = root.join("project with spaces");
+        std::fs::create_dir_all(&project).unwrap();
+        let shell = root.join("login-shell");
+        std::fs::write(
+            &shell,
+            r#"#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = "-l" ]; then
+    printf 'default:%s\n' "$PWD"
+elif [ "$#" -eq 4 ] && [ "$1" = "-l" ] && [ "$2" = "-i" ] && [ "$3" = "-c" ]; then
+    export MIAO_LOGIN_READY=ready
+    /bin/sh -c "$4"
+else
+    exit 99
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Shell expressions must reach the inner shell verbatim, and expand
+        // only there. Include quotes, consecutive backslashes and Unicode.
+        let command = r#"printf '%s\n' "$PWD" "$MIAO_LOGIN_READY" 'it'\''s \\ $literal `literal` 🐈'; exit 7"#;
+        let mut checked = 0;
+        for outer in ["/bin/sh", "bash", "zsh", "dash", "ksh", "fish"] {
+            for cwd in ["~/project with spaces", ""] {
+                let cmd = remote_shell_argv("box", &[], cwd, Some(command))
+                    .pop()
+                    .unwrap();
+                let out = match std::process::Command::new(outer)
+                    .args(["-c", &cmd])
+                    .env("SHELL", &shell)
+                    .env("HOME", &root)
+                    .current_dir(&root)
+                    .output()
+                {
+                    Ok(out) => out,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => panic!("starting {outer}: {e}"),
+                };
+                let expected_cwd = if cwd.is_empty() { &root } else { &project };
+                assert!(
+                    out.status.success(),
+                    "{outer}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    format!(
+                        "{}\nready\nit's \\\\ $literal `literal` 🐈\ndefault:{}\n",
+                        expected_cwd.display(),
+                        expected_cwd.display()
+                    ),
+                    "{outer} lost the command or cwd"
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stderr)
+                        .contains("Work tab command exited with status 7"),
+                    "{outer} hid the command failure"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2, "no shell available to execute with");
+
+        // A bad cwd must not run the command in some other directory.
+        let cmd = remote_shell_argv("box", &[], "~/missing", Some("echo should-not-run"))
+            .pop()
+            .unwrap();
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", &cmd])
+            .env("SHELL", &shell)
+            .env("HOME", &root)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// The regression that made `w` unusable on a remote row: the command ssh
@@ -4277,7 +4418,7 @@ mod tests {
     /// rule [`login_shell_safe`] documents.
     #[test]
     fn remote_shell_command_parses_under_every_login_shell() {
-        let cmd = remote_shell_argv("box", &[], "~/proj").pop().unwrap();
+        let cmd = remote_shell_argv("box", &[], "~/proj", None).pop().unwrap();
         let mut checked = 0;
         for (shell, check) in [
             ("/bin/sh", "-n"),

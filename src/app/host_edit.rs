@@ -192,7 +192,7 @@ pub(crate) struct HostLogView {
 
 /// One editable host row in the popup.
 ///
-/// The four text fields are [`TextInput`](picker::TextInput)s rather than bare
+/// The text fields are [`TextInput`](picker::TextInput)s rather than bare
 /// `String`s. They hold ssh targets and argument lines long enough that fixing a
 /// typo in the middle has to be possible, which needs a cursor — and the widget
 /// that has one already backs every picker's query and the directory-mark
@@ -214,6 +214,7 @@ pub(crate) struct HostRow {
     pub(in crate::app) disabled: bool,
     /// Advanced SSH arguments, parsed without shell expansion.
     pub(in crate::app) options: picker::TextInput,
+    pub(in crate::app) shell_command: picker::TextInput,
     pub(in crate::app) forwards: Vec<crate::ssh_forward::Rule>,
     /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
     /// A form field, toggled with `Space`: the panel's plain letters are for
@@ -246,6 +247,8 @@ impl HostRow {
             disabled: self.disabled,
             clipboard: self.clipboard,
             options: hosts::split_options(self.options.text()),
+            shell_command: (!self.shell_command.text().trim().is_empty())
+                .then(|| self.shell_command.text().to_string()),
             forwards: self.forwards.clone(),
         };
         config.migrate_forwards();
@@ -277,6 +280,7 @@ pub(crate) enum HostField {
     CodexMode,
     CodexEndpoint,
     Forwards,
+    ShellCommand,
 }
 
 impl HostField {
@@ -285,10 +289,9 @@ impl HostField {
     /// widest hint over these fields sets its width and the count sets its
     /// height, so a sixth field changes the box without anyone resizing it.
     ///
-    /// `Clipboard` is last rather than beside `Options`, where it belongs by
-    /// meaning: the four text fields keep the Tab positions fingers already know,
-    /// and `^e`'s "open the editor on Icon" stays the fourth stop it names.
-    const ORDER: [HostField; 8] = [
+    /// New fields follow the original Label, Target, Options, Icon and Clipboard
+    /// fields so their familiar Tab positions stay the same.
+    const ORDER: [HostField; 9] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
@@ -297,6 +300,7 @@ impl HostField {
         HostField::CodexMode,
         HostField::CodexEndpoint,
         HostField::Forwards,
+        HostField::ShellCommand,
     ];
 
     fn label(self) -> &'static str {
@@ -304,6 +308,7 @@ impl HostField {
             Self::Label => "Label",
             Self::Target => "Target",
             Self::Options => "Advanced SSH options",
+            Self::ShellCommand => "Work tab command",
             Self::Forwards => "Port forwards",
             Self::Icon => "Icon",
             Self::Clipboard => "Clipboard",
@@ -315,7 +320,7 @@ impl HostField {
     fn visible_for(self, row: &HostRow) -> bool {
         match self {
             Self::Forwards => !row.is_local && !row.is_socket && row.config().is_some(),
-            Self::Options => !row.is_local && !row.is_socket,
+            Self::Options | Self::ShellCommand => !row.is_local && !row.is_socket,
             Self::CodexMode => row.codex.is_some(),
             Self::CodexEndpoint => row
                 .codex
@@ -875,6 +880,16 @@ impl App {
                     ))]],
                 ));
             }
+            if HostField::ShellCommand.visible_for(r) {
+                let mut command_lines =
+                    text_field_lines(&r.shell_command, focus == HostField::ShellCommand, value_w);
+                if r.shell_command.text().trim().is_empty()
+                    && let Some(last) = command_lines.last_mut()
+                {
+                    last.push(Span::styled("(default shell)", Style::default().dim()));
+                }
+                form_lines.extend(field_rows(HostField::ShellCommand, command_lines));
+            }
             // The field rows — one per field until a value wraps — a blank, the
             // hint line (held whether this field has a hint or not, for the same
             // reason the width is), and the two borders. The card grows down as a
@@ -1180,6 +1195,9 @@ impl App {
                 HostField::Options => {
                     r.options.handle_key(key);
                 }
+                HostField::ShellCommand => {
+                    r.shell_command.handle_key(key);
+                }
                 // Capped like the directory-mark icon, and for the same reason
                 // now that the two share one table column: past ~4 cells an
                 // "icon" stops reading as a mark and just widens the column for
@@ -1380,6 +1398,7 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         HostField::Target => Some("  ^t toggle ssh / socket"),
         // Point port setup toward the dedicated manager beside this field.
         HostField::Options => Some("  Quoted SSH arguments; use Port forwards below for tunnels"),
+        HostField::ShellCommand => Some("  Runs in new remote work tabs; empty = default shell"),
         HostField::Forwards => {
             Some("  Enter manage ports or import -L/-R/-D; save host edits first")
         }
