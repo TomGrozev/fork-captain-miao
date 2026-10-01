@@ -44,6 +44,12 @@ launcher started, so migration can proceed incrementally.
 | Goal continuation | Native goal-store read | Goal notifications |
 | Stop | End the Codex process | Pause an active goal, interrupt the current turn, clean background terminals |
 
+The app-server resume picker includes unarchived interactive conversations from
+both the Codex CLI and editor. Codex's default source filter excludes internal
+subagent threads and noninteractive runs. The configured
+`launcher.resume_list_limit` bounds the combined picker across agents, with the
+most recently updated sessions first.
+
 `native.rs` owns SQLite, rollouts and the managed hook profile. `app_server/`
 owns WebSocket transport, protocol observation and thread control. `tui.rs`
 contains only shared terminal behavior and home resolution. Both adapters use

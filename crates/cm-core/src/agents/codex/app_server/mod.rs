@@ -41,13 +41,14 @@ pub fn list_resumable(config: &CodexConfig, limit: usize) -> Result<Vec<ResumeCa
         let mut candidates = Vec::new();
         let mut cursor = None;
         while candidates.len() < limit {
+            // Codex defaults to interactive sources (CLI and editor). A CLI-only
+            // filter hides editor sessions from this host's resume picker.
             let result = client
                 .request(
                     "thread/list",
                     json!({
                         "limit": (limit-candidates.len()).min(100), "cursor":cursor,
-                        "sortKey":"updated_at", "useStateDbOnly":true, "archived":false,
-                        "sourceKinds":["cli"]
+                        "sortKey":"updated_at", "useStateDbOnly":true, "archived":false
                     }),
                 )
                 .await?;

@@ -1192,6 +1192,53 @@ fn live_app_server_supports_read_only_inventory() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inventory_includes_cli_and_editor_sessions_without_internal_threads() {
+    let scratch = Scratch::new();
+    let path = scratch.0.join("inventory.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let config = CodexConfig {
+        endpoint: format!("unix://{}", path.display()),
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let init = receive(&mut socket).await;
+        send(&mut socket, &json!({"id":init["id"],"result":{}})).await;
+        assert_eq!(receive(&mut socket).await["method"], "initialized");
+        let request = receive(&mut socket).await;
+        assert_eq!(request["method"], "thread/list");
+        let sources = request["params"]["sourceKinds"].as_array();
+        let data: Vec<_> = ["cli", "vscode", "exec", "subAgentOther"]
+            .into_iter()
+            .filter(|source| {
+                match sources.filter(|sources| !sources.is_empty()) {
+                    Some(sources) => sources.contains(&json!(source)),
+                    None => matches!(*source, "cli" | "vscode"),
+                }
+            })
+            .map(|source| {
+                json!({"id":format!("thread-{source}"),"cwd":"/work","source":source,"updatedAt":10})
+            })
+            .collect();
+        send(
+            &mut socket,
+            &json!({"id":request["id"],"result":{"data":data,"nextCursor":null}}),
+        )
+        .await;
+    });
+    let candidates = list_resumable(&config, 10).unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["thread-cli", "thread-vscode"]
+    );
+}
+
 #[tokio::test]
 async fn pause_waits_for_forwarded_lifecycle_replies() {
     for method in ["thread/resume", "turn/start", "thread/goal/set"] {
