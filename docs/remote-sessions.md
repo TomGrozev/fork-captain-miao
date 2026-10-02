@@ -219,9 +219,9 @@ library**.
     `SSH_AUTH_SOCK`**. No agent socket, no chmod — the whole chain stays `0755`
     and the secret is readable by every local account on the host.
 
-    A remote attach with the per-host `SSH agent` setting off (the default)
-    arrives with no `SSH_AUTH_SOCK`, so the hardening never fires. Enabling
-    `forward_agent` adds `ForwardAgent=yes` to that host's SSH calls. A local
+    A remote attach arrives with agent forwarding disabled, so the hardening
+    never fires. The per-host `Git SSH agent` setting only forwards an agent
+    for network Git requests, leaving attaches without `SSH_AUTH_SOCK`. A local
     desktop attach usually *does* have one and so lands `0700` — which makes this
     worse, not better: the protection is incidental, and it is absent precisely in the
     remote-container case this feature exists to serve.
@@ -617,26 +617,31 @@ the full sequence and re-runs it on every reconnect:
    `ControlMaster=auto` + per-host `ControlPath` + `BatchMode` (key/agent auth
    only). Steps 1–3 ride one authenticated TCP connection.
 
-   When the host's `SSH agent` field is enabled (`forward_agent` in
-   `hosts.json`, default false), all its SSH calls carry `ForwardAgent=yes`.
-   The tunnel opens a session channel instead of using `-N`: a POSIX shell
-   reports its `SSH_AUTH_SOCK` and waits on the dashboard-held stdin. OpenSSH
-   keeps that session's agent socket alive until the tunnel ends. The connection
-   task monitors the child, clears the socket on disconnect, and discovers a
-   fresh socket on reconnect. `PrepareVcs` and `RunVcs` carry that client's
-   current socket in an additive `ssh_auth_sock` field; the server expands it
-   and sets it only on network Git children. The persistent daemon's environment
-   is never changed, so concurrent dashboards cannot overwrite each other's
-   Git credentials. An absent field preserves host authentication; an empty
-   field clears an unavailable forwarded agent. Attach and work-tab windows
-   use ordinary OpenSSH forwarding, including the pool's existing stable
-   per-session agent link.
+   The shared master, provisioning, attach windows and work tabs always use
+   `ForwardAgent=no` and `-a`, even if SSH configuration enables forwarding.
+   The host's `Git SSH agent` field (`forward_agent` in `hosts.json`, default
+   false) applies only to network Git RPCs. A separate SSH child uses
+   `ForwardAgent=yes`, `ControlPath=none`, `ControlMaster=no`, and
+   `ControlPersist=no`; it never joins the shared master or backgrounds itself.
+   Authentication and routing options still apply, but session/multiplexing
+   overrides and unrelated port forwards do not. A POSIX shell reports its home
+   and `SSH_AUTH_SOCK`, then waits on dashboard-held stdin. The dashboard keeps
+   this child alive only until the Git reply, timeout, cancellation or link loss.
+   Missing or refused forwarding fails before submitting Git, with no fallback
+   to the daemon's inherited agent.
 
-   Agent-enabled hosts use a separate control socket from agent-disabled hosts:
-   an OpenSSH master created with agent forwarding off refuses later clients'
-   forwarding requests. This also keeps two aliases with different agent modes
-   independent. Toggling the field retires the previous mode's master, so existing
-   attach windows detach and their pooled sessions remain available to reattach.
+   `PrepareVcs` and `RunVcs` carry that socket in the additive `ssh_auth_sock`
+   field, using host-canonical paths. The existing daemon receives the RPC over
+   the normal host link and sets the socket only on network Git children. Its
+   environment never changes, and confirmed plans retain the same daemon
+   instance identity. Push preparation needs no agent. Pull preparation checks
+   and fetches the remote branch with its own short SSH connection; forwarding
+   closes before confirmation and a new connection supplies the confirmed run.
+   An absent field preserves host authentication for disabled forwarding or
+   direct socket transports. Toggling the setting affects subsequent Git
+   requests without replacing the backend. The remote account or root can still
+   use the agent while it is forwarded; shortening its lifetime does not make
+   an untrusted host safe.
 
    A host offered the clipboard (the `Clipboard` field, §9) takes **one extra
    round trip between the cancel and the tunnel child**, and then a second

@@ -72,7 +72,7 @@ pub(super) struct HostConfig {
     /// dies with the connection exactly like a user-typed forward.
     #[serde(default)]
     pub clipboard: bool,
-    /// Forward the dashboard's SSH agent to this SSH host, including Git RPCs.
+    /// Forward the dashboard's SSH agent only during network Git RPCs.
     #[serde(default)]
     pub forward_agent: bool,
 }

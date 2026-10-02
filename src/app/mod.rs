@@ -668,7 +668,6 @@ pub(in crate::app) enum HostTarget {
         /// Connection arguments after legacy forwarding options are migrated.
         options: Vec<String>,
         clipboard: bool,
-        forward_agent: bool,
     },
 }
 
@@ -2542,7 +2541,6 @@ impl App {
                         target: ssh.clone(),
                         options: h.options.clone(),
                         clipboard: h.clipboard,
-                        forward_agent: h.forward_agent,
                     },
                     (None, None) => return None,
                 };
@@ -2565,7 +2563,6 @@ impl App {
                 target,
                 options,
                 clipboard,
-                forward_agent,
             } => Transport::Ssh {
                 target: target.clone(),
                 // One short, OS-limit-safe local socket per host; ssh forwards
@@ -2577,7 +2574,7 @@ impl App {
                 options: options.clone(),
                 forwards,
                 clipboard: *clipboard,
-                forward_agent: *forward_agent,
+                forward_agent: false,
             },
         };
         Backend::Remote(RemoteBackend::connect(transport, host))
@@ -2709,10 +2706,12 @@ impl App {
                 )
             });
             if let Backend::Remote(remote) = &backend
-                && let Some(manager) = &remote.forwards
                 && let Some(host) = hosts.iter().find(|h| h.label == identity.label)
             {
-                manager.configure(host.forwards.clone());
+                remote.set_git_agent_forwarding(host.forward_agent);
+                if let Some(manager) = &remote.forwards {
+                    manager.configure(host.forwards.clone());
+                }
             }
             self.backends.push(backend);
         }

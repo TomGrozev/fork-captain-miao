@@ -6982,7 +6982,7 @@ fn work_tab_command_edits_apply_without_replacing_the_connection() {
 }
 
 #[test]
-fn ssh_agent_toggle_reconnects_only_ssh_hosts() {
+fn ssh_agent_toggle_keeps_the_host_connection() {
     use super::hosts::HostConfig;
     let host = HostConfig {
         label: "example".into(),
@@ -6995,8 +6995,8 @@ fn ssh_agent_toggle_reconnects_only_ssh_hosts() {
         forward_agent: true,
         ..host.clone()
     });
-    assert_eq!(App::plan_reconcile(&before, &enabled), vec![None]);
-    assert_eq!(App::plan_reconcile(&enabled, &before), vec![None]);
+    assert_eq!(App::plan_reconcile(&before, &enabled), vec![Some(0)]);
+    assert_eq!(App::plan_reconcile(&enabled, &before), vec![Some(0)]);
     let socket = HostConfig {
         socket: Some("/tmp/example.sock".into()),
         ..host

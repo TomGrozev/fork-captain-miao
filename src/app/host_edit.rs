@@ -353,7 +353,7 @@ impl HostField {
             Self::Forwards => "Port forwards",
             Self::Icon => "Icon",
             Self::Clipboard => "Clipboard",
-            Self::SshAgent => "SSH agent",
+            Self::SshAgent => "Git SSH agent",
             Self::CodexMode => "Codex connection",
             Self::CodexEndpoint => "Codex endpoint",
         }
@@ -900,7 +900,10 @@ impl App {
             if !row.is_socket {
                 append(
                     &mut lines,
-                    format!("SSH agent {}", if row.forward_agent { "on" } else { "off" }),
+                    format!(
+                        "Git SSH agent {}",
+                        if row.forward_agent { "on" } else { "off" }
+                    ),
                     Style::default(),
                 );
             }
@@ -1864,7 +1867,7 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
         // Name whose clipboard is offered, as well as the toggle key.
         HostField::Clipboard => Some("  Space toggle · offer the local clipboard"),
-        HostField::SshAgent => Some("  Space toggle · use the local SSH agent on this host"),
+        HostField::SshAgent => Some("  Space toggle · local SSH agent for push/pull only"),
     }
 }
 

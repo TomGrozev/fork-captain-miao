@@ -238,25 +238,19 @@ fn prepare_vcs_command(
             }
             RemoteReach::Up(remote) => {
                 match remote
-                    .request_within(VCS_COMMAND_TIMEOUT, |req_id| {
-                        cm_core::protocol::ClientFrame::PrepareVcs {
-                            req_id,
-                            cwd: cwd.clone(),
-                            push,
-                            ssh_auth_sock: remote.vcs_ssh_auth_sock(),
-                        }
-                    })
+                    .prepare_vcs_within(VCS_COMMAND_TIMEOUT, cwd.clone(), push)
                     .await
                 {
-                    Some(cm_core::protocol::ServerFrame::VcsPrepared {
+                    Ok(Some(cm_core::protocol::ServerFrame::VcsPrepared {
                         plan: Some(plan),
                         error: None,
                         ..
-                    }) => Ok(plan),
-                    Some(cm_core::protocol::ServerFrame::VcsPrepared {
+                    })) => Ok(plan),
+                    Ok(Some(cm_core::protocol::ServerFrame::VcsPrepared {
                         error: Some(error),
                         ..
-                    }) => Err(error),
+                    })) => Err(error),
+                    Err(error) => Err(error),
                     _ => Err(
                         "host did not prepare the command; check its connection and server version"
                             .into(),
@@ -401,19 +395,13 @@ fn start_vcs_command(
     tokio::spawn(async move {
         let (ok, message) = if let Some(remote) = remote {
             let reply = remote
-                .request_within(VCS_COMMAND_TIMEOUT, |req_id| {
-                    cm_core::protocol::ClientFrame::RunVcs {
-                        req_id,
-                        cwd: cwd.clone(),
-                        plan,
-                        ssh_auth_sock: remote.vcs_ssh_auth_sock(),
-                    }
-                })
+                .run_vcs_within(VCS_COMMAND_TIMEOUT, cwd.clone(), plan)
                 .await;
             match reply {
-                Some(cm_core::protocol::ServerFrame::VcsCommandDone { ok, message, .. }) => {
-                    (ok, message)
-                }
+                Ok(Some(cm_core::protocol::ServerFrame::VcsCommandDone {
+                    ok, message, ..
+                })) => (ok, message),
+                Err(message) => (false, message),
                 _ => (
                     false,
                     "no answer from the host; outcome unknown — verify before retrying".to_string(),
