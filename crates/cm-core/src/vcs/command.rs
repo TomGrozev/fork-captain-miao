@@ -9,6 +9,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::process::run_git_with_agent;
 use super::{
     VcsOutcome, expand, finish_command, lock_until, outcome_message, remotes, run_git,
     status_locked,
@@ -63,27 +64,50 @@ struct Checkout {
 const CHANGED: &str = "checkout or destination changed; request a fresh confirmation";
 
 pub fn prepare(cwd: &str, push: bool, deadline: Instant) -> Result<VcsPlan, String> {
+    prepare_with_agent(cwd, push, None, deadline)
+}
+
+/// Prepare using this client's agent without changing the daemon environment.
+pub fn prepare_with_agent(
+    cwd: &str,
+    push: bool,
+    ssh_auth_sock: Option<&str>,
+    deadline: Instant,
+) -> Result<VcsPlan, String> {
+    let ssh_auth_sock =
+        ssh_auth_sock.map(|socket| crate::paths::expand_home(socket, &crate::paths::host_home()));
+    let ssh_auth_sock = ssh_auth_sock.as_deref();
     let _guard = lock_until(deadline).map_err(failure)?;
     let cwd = expand(cwd)
         .canonicalize()
         .map_err(|_| "directory is gone")?;
     let mut checkout = inspect(&cwd, push, deadline)?;
     if !push {
-        let commit = remote_tip(&cwd, &checkout.url, &checkout.plan.target_ref, deadline)?;
+        let commit = remote_tip(
+            &cwd,
+            &checkout.url,
+            &checkout.plan.target_ref,
+            ssh_auth_sock,
+            deadline,
+        )?;
         // Fetch only the announced object. Another agent's FETCH_HEAD cannot
         // replace the candidate, and no branch/worktree moves before consent.
-        success(
-            &cwd,
-            &[
-                "fetch",
-                "--no-tags",
-                "--no-recurse-submodules",
-                "--no-write-fetch-head",
-                "--",
-                &checkout.url,
-                &commit,
-            ],
-            deadline,
+        finish_command(
+            run_git_with_agent(
+                &cwd,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    "--",
+                    &checkout.url,
+                    &commit,
+                ],
+                ssh_auth_sock,
+                deadline,
+            ),
+            "fetched",
         )?;
         if inspect(&cwd, push, deadline)?.plan != checkout.plan {
             return Err(CHANGED.into());
@@ -109,6 +133,19 @@ pub fn prepare(cwd: &str, push: bool, deadline: Instant) -> Result<VcsPlan, Stri
 }
 
 pub fn execute(cwd: &str, expected: &VcsPlan, deadline: Instant) -> Result<String, String> {
+    execute_with_agent(cwd, expected, None, deadline)
+}
+
+/// Execute using this client's current agent, which may change after reconnect.
+pub fn execute_with_agent(
+    cwd: &str,
+    expected: &VcsPlan,
+    ssh_auth_sock: Option<&str>,
+    deadline: Instant,
+) -> Result<String, String> {
+    let ssh_auth_sock =
+        ssh_auth_sock.map(|socket| crate::paths::expand_home(socket, &crate::paths::host_home()));
+    let ssh_auth_sock = ssh_auth_sock.as_deref();
     let _guard = lock_until(deadline).map_err(failure)?;
     let cwd = expand(cwd).canonicalize().map_err(|_| CHANGED)?;
     let checkout = validate(&cwd, expected, deadline)?;
@@ -122,7 +159,7 @@ pub fn execute(cwd: &str, expected: &VcsPlan, deadline: Instant) -> Result<Strin
         // Explicit URL and OID prevent config changes and moving local refs
         // from redirecting this invocation or publishing unconfirmed commits.
         finish_command(
-            run_git(
+            run_git_with_agent(
                 &cwd,
                 &[
                     "-c",
@@ -137,6 +174,7 @@ pub fn execute(cwd: &str, expected: &VcsPlan, deadline: Instant) -> Result<Strin
                     &checkout.url,
                     &refspec,
                 ],
+                ssh_auth_sock,
                 deadline,
             ),
             "pushed",
@@ -176,7 +214,14 @@ pub fn execute(cwd: &str, expected: &VcsPlan, deadline: Instant) -> Result<Strin
             .as_deref()
             .filter(|oid| valid_oid(oid))
             .ok_or(CHANGED)?;
-        if remote_tip(&cwd, &checkout.url, &expected.target_ref, deadline)? != commit {
+        if remote_tip(
+            &cwd,
+            &checkout.url,
+            &expected.target_ref,
+            ssh_auth_sock,
+            deadline,
+        )? != commit
+        {
             return Err(CHANGED.into());
         }
         // The network wait is a second opportunity for an agent to change the
@@ -451,12 +496,25 @@ fn valid_oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn remote_tip(cwd: &Path, url: &str, target: &str, deadline: Instant) -> Result<String, String> {
-    let output = line(
+fn remote_tip(
+    cwd: &Path,
+    url: &str,
+    target: &str,
+    ssh_auth_sock: Option<&str>,
+    deadline: Instant,
+) -> Result<String, String> {
+    let output = run_git_with_agent(
         cwd,
         &["ls-remote", "--exit-code", "--refs", "--", url, target],
+        ssh_auth_sock,
         deadline,
-    )?;
+    )
+    .map_err(failure)?;
+    // Keep authentication failures actionable, as for fetch and push.
+    if !output.status_ok {
+        return finish_command(Ok(output), "checked remote");
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
     let mut lines = output.lines();
     let (oid, name) = lines
         .next()
@@ -641,6 +699,81 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn git_network_commands_use_the_request_agent_after_reconnect() {
+        let repo = Repo::new();
+        repo.publish();
+        let remote_commit = repo.advance_remote();
+        let script = repo.root.join("agent-ssh");
+        let expected = repo.root.join("agent-ssh.expected");
+        std::fs::write(
+            &script,
+            r#"
+if [ "$SSH_AUTH_SOCK" != "$(cat "$0.expected")" ]; then
+    echo "request agent missing" >&2
+    exit 1
+fi
+for last do :; done
+exec sh -c "$last"
+"#,
+        )
+        .unwrap();
+        git(
+            &repo.work,
+            &[
+                "config",
+                "core.sshCommand",
+                &format!(
+                    "sh {}",
+                    crate::paths::shell_quote_host_path(script.to_str().unwrap())
+                ),
+            ],
+        );
+        git(&repo.work, &["config", "ssh.variant", "simple"]);
+        git(
+            &repo.work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("example:{}", repo.remote.display()),
+            ],
+        );
+        let cwd = repo.work.to_str().unwrap();
+        let process_agent = std::env::var_os("SSH_AUTH_SOCK");
+        std::fs::write(&expected, "/tmp/agent-first.sock").unwrap();
+        let pull =
+            prepare_with_agent(cwd, false, Some("/tmp/agent-first.sock"), deadline()).unwrap();
+        // Preparation authenticates both ls-remote and fetch. Execution uses a
+        // replacement connection's agent and keeps the same confirmed commit.
+        std::fs::write(&expected, "/tmp/agent-second.sock").unwrap();
+        assert!(
+            execute_with_agent(cwd, &pull, Some("/tmp/agent-first.sock"), deadline())
+                .unwrap_err()
+                .contains("request agent missing")
+        );
+        assert_eq!(
+            execute_with_agent(cwd, &pull, Some("/tmp/agent-second.sock"), deadline()).unwrap(),
+            "pulled"
+        );
+        assert_eq!(git(&repo.work, &["rev-parse", "HEAD"]), remote_commit);
+        git(
+            &repo.work,
+            &["commit", "-q", "--allow-empty", "-m", "local change"],
+        );
+        let push =
+            prepare_with_agent(cwd, true, Some("/tmp/agent-second.sock"), deadline()).unwrap();
+        assert_eq!(
+            execute_with_agent(cwd, &push, Some("/tmp/agent-second.sock"), deadline()).unwrap(),
+            "pushed"
+        );
+        assert_eq!(
+            git(&repo.remote, &["rev-parse", "refs/heads/main"]),
+            git(&repo.work, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(std::env::var_os("SSH_AUTH_SOCK"), process_agent);
     }
 
     #[test]

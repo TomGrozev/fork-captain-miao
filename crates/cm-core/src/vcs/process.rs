@@ -26,18 +26,35 @@ pub(super) fn run_git(cwd: &Path, args: &[&str], deadline: Instant) -> Result<Gi
     run_git_read(cwd, args, deadline, |pipe| super::read_capped(Some(pipe)))
 }
 
+pub(super) fn run_git_with_agent(
+    cwd: &Path,
+    args: &[&str],
+    ssh_auth_sock: Option<&str>,
+    deadline: Instant,
+) -> Result<GitOut, RunFail> {
+    let mut command = git_command(cwd, args);
+    if let Some(socket) = ssh_auth_sock {
+        command.env("SSH_AUTH_SOCK", socket);
+    }
+    run(command, deadline, |pipe| super::read_capped(Some(pipe)))
+}
+
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 pub(super) fn run_git_read<T: Send + 'static>(
     cwd: &Path,
     args: &[&str],
     deadline: Instant,
     read_stdout: impl FnOnce(DeadlineReader<ChildStdout>) -> T + Send + 'static,
 ) -> Result<GitOut<T>, RunFail> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0");
-    run(command, deadline, read_stdout)
+    run(git_command(cwd, args), deadline, read_stdout)
 }
 
 fn run<T: Send + 'static>(

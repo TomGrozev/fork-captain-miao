@@ -510,6 +510,17 @@ reconnect, `f` for port forwards, and `u` to upgrade the server when available.
 - **Advanced SSH options** accepts quoted SSH arguments; machine setup normally
   belongs in `~/.ssh/config`. Changing these connection options can reconnect
   the host. The forwarding list manages ports independently.
+- **SSH agent** — edit an SSH host with `Space h` → `e`, open Services
+  (`Alt+3`), and toggle this field with Space. Off by default; Enter applies it
+  and reconnects the host. Enabled hosts can use the dashboard machine's SSH
+  agent for Git push/pull, attached sessions, and work tabs. Start the dashboard
+  with access to your agent, usually through `SSH_AUTH_SOCK` or SSH's
+  `IdentityAgent` setting. Git commands require an updated `miao-server` and
+  receive the current connection's socket, including after reconnects; the
+  daemon's startup environment does not need to change. The setting is
+  `forward_agent` in `hosts.json`. Only enable it for hosts you trust: processes
+  on that host can request authentication through your agent while it is
+  forwarded.
 - **Work tab command** — edit an SSH host with `Space h` → `e` and set this
   optional field to `tmux`, `zellij`, or a command with arguments. Pressing `w`
   on one of that host's sessions opens a work tab in its directory and runs the

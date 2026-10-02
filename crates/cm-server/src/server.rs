@@ -987,11 +987,11 @@ async fn handle_conn(
                             req_id, ok: false, message: "update the dashboard to use checked Git commands".into(),
                         }).await?;
                     }
-                    ClientFrame::PrepareVcs { req_id, cwd, push } => {
+                    ClientFrame::PrepareVcs { req_id, cwd, push, ssh_auth_sock } => {
                         let deadline = std::time::Instant::now() + cm_core::vcs::COMMAND_LIMIT;
                         let tx = replies_tx.clone();
                         tokio::spawn(async move {
-                            let result = tokio::task::spawn_blocking(move || cm_core::vcs::prepare(&cwd, push, deadline))
+                            let result = tokio::task::spawn_blocking(move || cm_core::vcs::prepare_with_agent(&cwd, push, ssh_auth_sock.as_deref(), deadline))
                                 .await.unwrap_or_else(|_| Err("git failed".into()));
                             let (plan, error) = match result {
                                 Ok(plan) => (Some(Box::new(plan)), None),
@@ -1000,8 +1000,8 @@ async fn handle_conn(
                             let _ = tx.send(ServerFrame::VcsPrepared { req_id, plan, error });
                         });
                     }
-                    ClientFrame::RunVcs { req_id, cwd, plan } => {
-                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, plan);
+                    ClientFrame::RunVcs { req_id, cwd, plan, ssh_auth_sock } => {
+                        spawn_vcs_command(replies_tx.clone(), req_id, cwd, plan, ssh_auth_sock);
                     }
                     // A newer client's frame we don't know. Ignoring it keeps
                     // the connection alive (protocol §3 forward tolerance); a
@@ -1128,11 +1128,14 @@ fn spawn_vcs_command(
     req_id: u64,
     cwd: String,
     plan: Box<cm_core::vcs::VcsPlan>,
+    ssh_auth_sock: Option<String>,
 ) {
     let deadline = std::time::Instant::now() + cm_core::vcs::COMMAND_LIMIT;
     tokio::spawn(async move {
-        let result =
-            tokio::task::spawn_blocking(move || cm_core::vcs::execute(&cwd, &plan, deadline)).await;
+        let result = tokio::task::spawn_blocking(move || {
+            cm_core::vcs::execute_with_agent(&cwd, &plan, ssh_auth_sock.as_deref(), deadline)
+        })
+        .await;
         let (ok, message) = match result {
             Ok(Ok(message)) => (true, message),
             Ok(Err(message)) => (false, message),
@@ -1212,6 +1215,7 @@ mod tests {
                 req_id: 2,
                 cwd: "/no/such/vcs-checkout".into(),
                 push: true,
+                ssh_auth_sock: None,
             },
         )
         .await

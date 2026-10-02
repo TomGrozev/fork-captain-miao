@@ -219,11 +219,11 @@ library**.
     `SSH_AUTH_SOCK`**. No agent socket, no chmod — the whole chain stays `0755`
     and the secret is readable by every local account on the host.
 
-    captain-miao's remote attach is exactly that case. `ssh_common_opts` never
-    passes `-A`, so `ssh <target> miao-server attach …` arrives with no
-    `SSH_AUTH_SOCK` and the hardening never fires. A local desktop attach
-    usually *does* have one and so lands `0700` — which makes this worse, not
-    better: the protection is incidental, and it is absent precisely in the
+    A remote attach with the per-host `SSH agent` setting off (the default)
+    arrives with no `SSH_AUTH_SOCK`, so the hardening never fires. Enabling
+    `forward_agent` adds `ForwardAgent=yes` to that host's SSH calls. A local
+    desktop attach usually *does* have one and so lands `0700` — which makes this
+    worse, not better: the protection is incidental, and it is absent precisely in the
     remote-container case this feature exists to serve.
 
     Verified rather than read: attaching with `--inherit-env CM_TEST_SECRET`
@@ -616,6 +616,27 @@ the full sequence and re-runs it on every reconnect:
    `ssh -N -L <local>:<remote> <target>` child (`kill_on_drop`), under
    `ControlMaster=auto` + per-host `ControlPath` + `BatchMode` (key/agent auth
    only). Steps 1–3 ride one authenticated TCP connection.
+
+   When the host's `SSH agent` field is enabled (`forward_agent` in
+   `hosts.json`, default false), all its SSH calls carry `ForwardAgent=yes`.
+   The tunnel opens a session channel instead of using `-N`: a POSIX shell
+   reports its `SSH_AUTH_SOCK` and waits on the dashboard-held stdin. OpenSSH
+   keeps that session's agent socket alive until the tunnel ends. The connection
+   task monitors the child, clears the socket on disconnect, and discovers a
+   fresh socket on reconnect. `PrepareVcs` and `RunVcs` carry that client's
+   current socket in an additive `ssh_auth_sock` field; the server expands it
+   and sets it only on network Git children. The persistent daemon's environment
+   is never changed, so concurrent dashboards cannot overwrite each other's
+   Git credentials. An absent field preserves host authentication; an empty
+   field clears an unavailable forwarded agent. Attach and work-tab windows
+   use ordinary OpenSSH forwarding, including the pool's existing stable
+   per-session agent link.
+
+   Agent-enabled hosts use a separate control socket from agent-disabled hosts:
+   an OpenSSH master created with agent forwarding off refuses later clients'
+   forwarding requests. This also keeps two aliases with different agent modes
+   independent. Toggling the field retires the previous mode's master, so existing
+   attach windows detach and their pooled sessions remain available to reattach.
 
    A host offered the clipboard (the `Clipboard` field, §9) takes **one extra
    round trip between the cancel and the tunnel child**, and then a second

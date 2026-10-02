@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -120,9 +120,17 @@ fn detached(program: &str) -> Command {
 /// that second-guesses isn't one.
 ///
 /// An *edit* to any of these takes effect only because
-/// [`options_changed_since_last_dial`] retires the shared master first;
+/// [`changed_connection_options`] retires the previous master first;
 /// re-dialling on its own would re-join it and change nothing.
 fn ssh_common_opts(ctl: &Path, extra: &[String]) -> Vec<String> {
+    // A master started with ForwardAgent=no cannot forward an agent for a
+    // later multiplexed client. Keep enabled and disabled hosts independent,
+    // including aliases of the same target and dashboard restarts.
+    let ctl = if extra.iter().any(|option| option == "ForwardAgent=yes") {
+        ctl.with_extension("agent")
+    } else {
+        ctl.to_path_buf()
+    };
     let mut opts: Vec<String> = extra.to_vec();
     opts.extend([
         "-o".into(),
@@ -141,6 +149,15 @@ fn ssh_common_opts(ctl: &Path, extra: &[String]) -> Vec<String> {
         format!("ControlPath={}", ctl.display()),
     ]);
     opts
+}
+
+fn ssh_agent_options(options: &[String], forward_agent: bool) -> Vec<String> {
+    let mut options_with_agent = vec![
+        "-o".into(),
+        format!("ForwardAgent={}", if forward_agent { "yes" } else { "no" }),
+    ];
+    options_with_agent.extend_from_slice(options);
+    options_with_agent
 }
 
 /// Read a child's stdout and stderr to completion, but **bounded**: at most
@@ -1416,6 +1433,7 @@ pub(crate) enum Transport {
         /// `-R` alongside the user's own forwards. See
         /// [`clipboard_forward_for_home`].
         clipboard: bool,
+        forward_agent: bool,
     },
 }
 
@@ -1446,6 +1464,9 @@ pub(crate) struct RemoteBackend {
     /// safe to repeat, which is what lets an attach window and the `w` shell
     /// carry them too. Empty for a socket transport, which runs no ssh.
     ssh_options: Vec<String>,
+    forward_agent: bool,
+    /// The socket of this connection's live SSH session, refreshed on reconnect.
+    ssh_auth_sock: Arc<Mutex<Option<String>>>,
     pub(crate) forwards: Option<Arc<forwards::Manager>>,
     /// Whether this backend's transport is [`Transport::LocalSocket`], i.e. the
     /// daemon is on *this* machine. Distinguishes pooled-localhost (where a
@@ -1672,7 +1693,11 @@ impl RemoteBackend {
         // An attach window must not request user forwards; their manager
         // owns them on the shared master.
         let ssh_options = match &transport {
-            Transport::Ssh { options, .. } => split_connection_options(options).0,
+            Transport::Ssh {
+                options,
+                forward_agent,
+                ..
+            } => ssh_agent_options(&split_connection_options(options).0, *forward_agent),
             Transport::LocalSocket(_) => Vec::new(),
         };
         let transport_is_local = matches!(transport, Transport::LocalSocket(_));
@@ -1681,6 +1706,14 @@ impl RemoteBackend {
         let presumed_attached = Arc::new(Mutex::new(HashMap::new()));
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
         let conn = Arc::new(Mutex::new(ConnState::Connecting));
+        let forward_agent = matches!(
+            transport,
+            Transport::Ssh {
+                forward_agent: true,
+                ..
+            }
+        );
+        let ssh_auth_sock = Arc::new(Mutex::new(None));
         let dirty = Arc::new(AtomicBool::new(false));
         let mirrored = Arc::new(AtomicBool::new(false));
         let server_version = Arc::new(Mutex::new(None));
@@ -1711,6 +1744,7 @@ impl RemoteBackend {
             presumed_attached: presumed_attached.clone(),
             remote_exe: remote_exe.clone(),
             conn: conn.clone(),
+            ssh_auth_sock: ssh_auth_sock.clone(),
             dirty: dirty.clone(),
             mirrored: mirrored.clone(),
             server_version: server_version.clone(),
@@ -1727,6 +1761,8 @@ impl RemoteBackend {
             host,
             attach_target,
             ssh_options,
+            forward_agent,
+            ssh_auth_sock,
             forwards,
             transport_is_local,
             mirror,
@@ -1747,6 +1783,17 @@ impl RemoteBackend {
             log,
         });
         (backend, shared, rx)
+    }
+
+    /// Git receives this client's socket, never a previous daemon login's agent.
+    pub(crate) fn vcs_ssh_auth_sock(&self) -> Option<String> {
+        self.forward_agent.then(|| {
+            self.ssh_auth_sock
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default()
+        })
     }
 
     /// Current connection health, for the header surface.
@@ -2440,6 +2487,7 @@ struct ConnectionShared {
     presumed_attached: Arc<Mutex<HashMap<SessionKey, bool>>>,
     remote_exe: Arc<Mutex<String>>,
     conn: Arc<Mutex<ConnState>>,
+    ssh_auth_sock: Arc<Mutex<Option<String>>>,
     dirty: Arc<AtomicBool>,
     mirrored: Arc<AtomicBool>,
     server_version: Arc<Mutex<Option<String>>>,
@@ -2469,6 +2517,7 @@ async fn connection_task(
         presumed_attached,
         remote_exe,
         conn,
+        ssh_auth_sock,
         dirty,
         mirrored,
         server_version,
@@ -2513,6 +2562,7 @@ async fn connection_task(
     // store rather than re-announce the same sentence.
     let mut standing_failure: Option<String> = None;
     loop {
+        *ssh_auth_sock.lock().unwrap() = None;
         if standing_failure.is_none() {
             store(ConnState::Connecting);
         }
@@ -2531,6 +2581,7 @@ async fn connection_task(
                 local_sock,
                 options,
                 clipboard,
+                forward_agent,
                 ..
             } => {
                 log.info(format!("connecting to {target} over ssh"));
@@ -2540,6 +2591,7 @@ async fn connection_task(
                         local_sock,
                         options,
                         clipboard: *clipboard,
+                        forward_agent: *forward_agent,
                     },
                     &remote_exe,
                     &upgrade,
@@ -2555,7 +2607,10 @@ async fn connection_task(
                 )
                 .await
                 {
-                    Some(child) => Some((local_sock.clone(), Some(child))),
+                    Some(tunnel) => {
+                        *ssh_auth_sock.lock().unwrap() = tunnel.agent_socket.clone();
+                        Some((local_sock.clone(), Some(tunnel)))
+                    }
                     None => {
                         tracing::warn!(target: "captain_miao::ssh", "{target}: ssh setup failed — will retry");
                         None
@@ -2563,7 +2618,7 @@ async fn connection_task(
                 }
             }
         };
-        let Some((sock_path, ssh_child)) = established else {
+        let Some((sock_path, mut ssh_child)) = established else {
             // A diagnosable cause (server missing, version mismatch, host
             // unreachable) is surfaced verbatim instead of a bare ⚠ (§4). The
             // task keeps retrying either way — `Failed` is a *label*, not a
@@ -2590,6 +2645,7 @@ async fn connection_task(
         let attempts = if ssh_child.is_some() { 16 } else { 3 };
         let Some(stream) = connect_with_retry(&sock_path, attempts).await else {
             drop(ssh_child); // kill_on_drop tears ssh down
+            *ssh_auth_sock.lock().unwrap() = None;
             // Setup got this far without a diagnosis, so an older one is stale.
             standing_failure = None;
             probe_cache = None;
@@ -2619,7 +2675,7 @@ async fn connection_task(
         log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
-        let outcome = serve(
+        let serving = serve(
             stream,
             MirrorCells {
                 mirror: &mirror,
@@ -2630,8 +2686,15 @@ async fn connection_task(
                 server_version: &server_version,
             },
             &mut requests,
-        )
-        .await;
+        );
+        let outcome = if let Some(tunnel) = ssh_child.as_mut() {
+            tokio::select! {
+                outcome = serving => outcome,
+                _ = tunnel.child.wait() => ServeOutcome::ConnectionLost,
+            }
+        } else {
+            serving.await
+        };
         // Forget remembered deploy failures and refusals only once the host has
         // *demonstrably* worked — which means the handshake and subscribe both
         // succeeded, not merely that a socket accepted us. Clearing at connect
@@ -2650,6 +2713,7 @@ async fn connection_task(
             forwards.disconnected().await;
         }
         drop(ssh_child); // explicit: kill the ssh child once the connection ends
+        *ssh_auth_sock.lock().unwrap() = None;
         // The mirror is now stale; clear it so the host shows no (misleading)
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
@@ -2795,11 +2859,23 @@ struct SshLink<'a> {
     options: &'a [String],
     /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
     clipboard: bool,
+    forward_agent: bool,
 }
 
+struct SshTunnel {
+    child: tokio::process::Child,
+    // Keep the remote `cat` alive even while Child::wait closes child.stdin.
+    _stdin: Option<tokio::process::ChildStdin>,
+    agent_socket: Option<String>,
+}
+
+// A session channel makes OpenSSH create an agent socket. Its stdin stays open
+// for the tunnel lifetime, so the socket cannot disappear after discovery.
+const SSH_AGENT_SESSION_SCRIPT: &str = "echo \"$SSH_AUTH_SOCK\"; exec cat >/dev/null";
+
 /// Stand up an ssh host: ensure the remote daemon is running (and learn its
-/// socket path) with `daemon ensure`, then spawn a **forward-only** `ssh -N -L
-/// <local>:<remote> target` child that just holds the tunnel. The daemon is
+/// socket path) with `daemon ensure`, then spawn an SSH tunnel. Agent forwarding
+/// holds a session channel open as well; other hosts use `ssh -N`. The daemon is
 /// self-daemonizing and persistent, so it's fully decoupled from this child —
 /// dropping the backend (or a reconnect) kills only the tunnel, never the daemon
 /// or its sessions. The returned child is `kill_on_drop`. Returns None if ssh or
@@ -2817,18 +2893,20 @@ async fn setup_ssh(
     failure: &mut Option<String>,
     prov: &mut Provisioning<'_>,
     log: &ConnLog,
-) -> Option<tokio::process::Child> {
+) -> Option<SshTunnel> {
     let SshLink {
         target,
         local_sock,
         options,
         clipboard,
+        forward_agent,
     } = link;
     // `forwards` stays owned until the probe reports the host's `$HOME`: the
     // clipboard forward joins the user's own set, which is what gets it the
     // cancel-then-request on reconnect, the retirement when the host leaves the
     // ssh set, and the `port forwards:` log line for free.
     let (extra, mut forwards) = split_connection_options(options);
+    let extra = ssh_agent_options(&extra, forward_agent);
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
     // ssh below (the probe) already needs it — so ensure the short ssh-socket
@@ -2845,15 +2923,20 @@ async fn setup_ssh(
     }
     // Ahead of the probe, because the probe is what would otherwise re-join the
     // stale master and make the new options inert — see
-    // [`options_changed_since_last_dial`]. Best-effort: a master that is already
+    // [`changed_connection_options`]. Best-effort: a master that is already
     // gone (or was never up) makes this a quiet no-op, and a failure only leaves
     // us where we were.
-    if options_changed_since_last_dial(prov.host, target, &extra) {
+    if let Some(previous) = changed_connection_options(prov.host, target, &extra) {
         log.info(
             "connection options changed — retiring the shared ssh connection so they take effect",
         );
         let mut exit = detached("ssh");
-        exit.args(&opts).arg("-O").arg("exit").arg(target);
+        // Toggling the agent changes the control socket; retire the previous
+        // master so existing attach windows stop forwarding the revoked agent.
+        exit.args(ssh_common_opts(&ctl, &previous))
+            .arg("-O")
+            .arg("exit")
+            .arg(target);
         bounded_status(exit, MUX_CONTROL_TIMEOUT).await;
     }
 
@@ -3025,9 +3108,8 @@ async fn setup_ssh(
         }
     }
 
-    // A forward-ONLY child: `-N` runs no remote command, it just holds the `-L`
-    // tunnel open (the daemon is already running and persistent — the tunnel and
-    // the daemon are now independent). Killed when the backend drops / on
+    // The tunnel also holds an agent session when requested. The daemon is
+    // already running and persistent, independent of this child. Killed on
     // reconnect, with no effect on the daemon. Detached stdin + stdout (must never
     // touch the TUI's terminal), but stderr → a per-host log file: ssh's
     // diagnostics for a failed forward are the only clue when the local socket
@@ -3045,9 +3127,11 @@ async fn setup_ssh(
         .unwrap_or_else(|_| Stdio::null());
     let mut cmd = detached("ssh");
     cmd.args(&opts)
-        .arg("-N")
         .arg("-L")
         .arg(format!("{}:{}", local_sock.display(), remote_sock));
+    if !forward_agent {
+        cmd.arg("-N");
+    }
     if !forwards.is_empty() {
         // Logged, because a forward that fails to bind only says so in ssh's
         // stderr file — the panel's `l` view should at least show what was asked
@@ -3064,11 +3148,61 @@ async fn setup_ssh(
             cmd.arg(&f.flag).arg(&f.spec);
         }
     }
-    cmd.arg(target)
-        .stderr(stderr)
-        .kill_on_drop(true)
-        .spawn()
-        .ok()
+    cmd.arg(target);
+    if forward_agent {
+        cmd.arg(login_shell_safe(SSH_AGENT_SESSION_SCRIPT))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+    }
+    let child = cmd.stderr(stderr).kill_on_drop(true).spawn().ok()?;
+    ssh_tunnel(
+        child,
+        forward_agent,
+        &provisioned.home.unwrap_or_default(),
+        log,
+    )
+    .await
+}
+
+async fn ssh_tunnel(
+    mut child: tokio::process::Child,
+    forward_agent: bool,
+    remote_home: &str,
+    log: &ConnLog,
+) -> Option<SshTunnel> {
+    let stdin = child.stdin.take();
+    let agent_socket = if forward_agent {
+        let stdout = child.stdout.take()?;
+        let mut socket = String::new();
+        let mut reader = BufReader::new(stdout.take(4096));
+        let read = tokio::time::timeout(MUX_CONTROL_TIMEOUT, reader.read_line(&mut socket)).await;
+        match read {
+            Ok(Ok(n)) if n > 0 && socket.ends_with('\n') => {
+                let socket = socket.trim_end();
+                if socket.is_empty() {
+                    log.error("SSH agent forwarding is enabled, but no agent is available to SSH");
+                    None
+                } else if Path::new(socket).is_absolute() {
+                    log.info("SSH agent forwarding is ready");
+                    Some(cm_core::paths::collapse_home(socket, remote_home))
+                } else {
+                    log.error("SSH did not report a valid agent socket");
+                    return None;
+                }
+            }
+            _ => {
+                log.error("SSH did not report its forwarded agent socket before the deadline");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    Some(SshTunnel {
+        child,
+        _stdin: stdin,
+        agent_socket,
+    })
 }
 
 /// Make the host's clipboard socket path bindable: create its parent dir and
@@ -3126,21 +3260,21 @@ fn clipboard_forward(remote_home: &str, local_sock: &Path) -> Forward {
 }
 
 /// The connection options this process has dialled with — the memo behind
-/// [`options_changed_since_last_dial`], from two angles, because one row's
+/// [`changed_connection_options`], from two angles, because one row's
 /// history and one target's master answer different halves of the question.
 #[derive(Default)]
 struct ConnOptionsMemo {
     /// `(host label, ssh target)` → what that panel row last dialled with.
     by_row: HashMap<ForwardKey, Vec<String>>,
-    /// ssh target → what the most recent dial to it used, which is the best
-    /// available account of what the master there was minted with.
+    /// ssh target + agent mode → options used by its most recent dial, the best
+    /// available account of what that master was minted with.
     by_target: HashMap<String, Vec<String>>,
 }
 
 static LAST_CONN_OPTIONS: LazyLock<Mutex<ConnOptionsMemo>> = LazyLock::new(Mutex::default);
 
-/// Whether the shared `ControlMaster` for `target` has to be retired before this
-/// dial, recording the options either way.
+/// Options of the previous `ControlMaster` to retire before this dial, recording
+/// the new options either way. Agent modes use separate control sockets.
 ///
 /// The `extra` half only, never the forwards: a `-L`/`-R` is requested through
 /// the master per connection and [`cancel_user_forwards`] already re-asks for it
@@ -3164,10 +3298,10 @@ static LAST_CONN_OPTIONS: LazyLock<Mutex<ConnOptionsMemo>> = LazyLock::new(Mutex
 ///
 /// **A row we have dialled before is judged by its own history; one we have not,
 /// by the master's.** Neither angle can be the only one.
-/// [`ssh_control_path`](state::ssh_control_path) hashes the target alone, so two
-/// panel rows naming the same machine share a master — judge a known row by the
-/// master and each sees the other's options as a change, exits the master it is
-/// connected through, drops the other's tunnel, and the pair flaps forever. But
+/// Rows naming the same target and agent mode share a master — judge a known
+/// row by the master and each sees the other's options as a change, exits the
+/// master it is connected through, drops the other's tunnel, and the pair flaps
+/// forever. But
 /// judge an *unknown* row by its own (empty) history and a rename reads as a
 /// first sighting, which the hosts panel makes ordinary: one `Enter` commits
 /// every field of a row at once, so changing the label and the options together
@@ -3185,16 +3319,30 @@ static LAST_CONN_OPTIONS: LazyLock<Mutex<ConnOptionsMemo>> = LazyLock::new(Mutex
 /// recoverable — ssh exits 255, which reads as a dropped link rather than a user
 /// close, so no session is ended, and the reconnect epoch's re-attach sweep puts
 /// the windows back — but it is the reason this is gated as tightly as it is.
-fn options_changed_since_last_dial(host: &HostId, target: &str, extra: &[String]) -> bool {
+fn changed_connection_options(
+    host: &HostId,
+    target: &str,
+    extra: &[String],
+) -> Option<Vec<String>> {
     let mut memo = LAST_CONN_OPTIONS.lock().unwrap();
     let row = memo
         .by_row
         .insert((host.0.clone(), target.to_string()), extra.to_vec());
-    let minted = memo.by_target.insert(target.to_string(), extra.to_vec());
+    let master = if extra.iter().any(|option| option == "ForwardAgent=yes") {
+        format!("agent:{target}")
+    } else {
+        target.to_string()
+    };
+    let minted = memo.by_target.insert(master, extra.to_vec());
     match row {
-        Some(row) => row.as_slice() != extra,
-        None => minted.is_some_and(|minted| minted.as_slice() != extra),
+        Some(row) => (row.as_slice() != extra).then_some(row),
+        None => minted.filter(|minted| minted.as_slice() != extra),
     }
+}
+
+#[cfg(test)]
+fn options_changed_since_last_dial(host: &HostId, target: &str, extra: &[String]) -> bool {
+    changed_connection_options(host, target, extra).is_some()
 }
 
 /// Every port-forward spec this process has asked a given ssh target's
@@ -3502,6 +3650,104 @@ mod tests {
     use crate::state::SessionStatus;
     use std::time::Duration;
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn ssh_agent_session_lives_until_the_tunnel_ends_and_refreshes_its_socket() {
+        let log = ConnLog::default();
+        for socket in [
+            "/path/to/repo/agent-first.sock",
+            "/path/to/repo/agent-second.sock",
+            "",
+        ] {
+            let child = Command::new("sh")
+                .args(["-c", SSH_AGENT_SESSION_SCRIPT])
+                .env("SSH_AUTH_SOCK", socket)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut tunnel = ssh_tunnel(child, true, "/path/to/repo", &log)
+                .await
+                .unwrap();
+            assert_eq!(
+                tunnel.agent_socket,
+                (!socket.is_empty())
+                    .then(|| cm_core::paths::collapse_home(socket, "/path/to/repo"))
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), tunnel.child.wait())
+                    .await
+                    .is_err()
+            );
+            // Monitoring the child must leave stdin open; dropping the held
+            // writer ends the session and releases its forwarded agent.
+            drop(tunnel._stdin.take());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), tunnel.child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[test]
+    fn git_agent_is_specific_to_the_backend_and_current_connection() {
+        let transport = |forward_agent| Transport::Ssh {
+            target: "example".into(),
+            local_sock: PathBuf::from("/tmp/example-forward.sock"),
+            options: vec![],
+            forwards: vec![],
+            clipboard: false,
+            forward_agent,
+        };
+        let (enabled, shared, _requests) =
+            RemoteBackend::build(&transport(true), HostId("enabled".into()));
+        let (disabled, _, _requests) =
+            RemoteBackend::build(&transport(false), HostId("disabled".into()));
+        assert_eq!(enabled.vcs_ssh_auth_sock(), Some(String::new()));
+        for socket in ["/tmp/agent-first.sock", "/tmp/agent-second.sock"] {
+            *shared.ssh_auth_sock.lock().unwrap() = Some(socket.into());
+            assert_eq!(enabled.vcs_ssh_auth_sock().as_deref(), Some(socket));
+            assert_eq!(disabled.vcs_ssh_auth_sock(), None);
+        }
+        *shared.ssh_auth_sock.lock().unwrap() = None;
+        assert_eq!(enabled.vcs_ssh_auth_sock(), Some(String::new()));
+        assert!(enabled.ssh_options.contains(&"ForwardAgent=yes".into()));
+        assert!(disabled.ssh_options.contains(&"ForwardAgent=no".into()));
+    }
+
+    #[test]
+    fn ssh_agent_modes_use_separate_masters_and_toggles_retire_the_previous_mode() {
+        let ctl = Path::new("/tmp/cm-control.sock");
+        let enabled = ssh_agent_options(&[], true);
+        let disabled = ssh_agent_options(&[], false);
+        let control_path = |extra: &[String]| {
+            ssh_common_opts(ctl, extra)
+                .into_iter()
+                .find(|arg| arg.starts_with("ControlPath="))
+                .unwrap()
+        };
+        assert_eq!(control_path(&enabled), "ControlPath=/tmp/cm-control.agent");
+        assert_eq!(control_path(&disabled), "ControlPath=/tmp/cm-control.sock");
+        let first = HostId("agent-mode-first".into());
+        let second = HostId("agent-mode-second".into());
+        let target = "agent-mode-example";
+        assert_eq!(changed_connection_options(&first, target, &disabled), None);
+        assert_eq!(changed_connection_options(&second, target, &enabled), None);
+        assert_eq!(
+            changed_connection_options(&first, target, &enabled),
+            Some(disabled.clone())
+        );
+        assert_eq!(changed_connection_options(&second, target, &enabled), None);
+        assert_eq!(
+            changed_connection_options(&first, target, &disabled),
+            Some(enabled)
+        );
+    }
 
     #[tokio::test]
     async fn outgoing_requests_preserve_fragmented_responses() {

@@ -255,6 +255,7 @@ pub(crate) struct HostRow {
     /// own state — `[off]` is visible in Services, where a list key was only
     /// discoverable from the footer.
     pub(in crate::app) clipboard: bool,
+    pub(in crate::app) forward_agent: bool,
 }
 
 impl HostRow {
@@ -278,6 +279,7 @@ impl HostRow {
             ssh: (!self.is_socket).then(|| target.to_string()),
             disabled: self.disabled,
             clipboard: self.clipboard,
+            forward_agent: self.forward_agent,
             options: hosts::split_options(self.options.text()),
             shell_command: (!self.shell_command.text().trim().is_empty())
                 .then(|| self.shell_command.text().to_string()),
@@ -307,8 +309,9 @@ pub(crate) enum HostField {
     Target,
     Options,
     Icon,
-    /// The one field with nothing to type — see [`HostRow::clipboard`].
+    /// A toggle — see [`HostRow::clipboard`].
     Clipboard,
+    SshAgent,
     CodexMode,
     CodexEndpoint,
     Forwards,
@@ -318,7 +321,7 @@ pub(crate) enum HostField {
 impl HostField {
     /// Form order. Tab walks all supported fields in section order, switching
     /// tabs as needed; each tab renders only its own fields.
-    const ORDER: [HostField; 9] = [
+    const ORDER: [HostField; 10] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
@@ -326,6 +329,7 @@ impl HostField {
         HostField::CodexMode,
         HostField::CodexEndpoint,
         HostField::Clipboard,
+        HostField::SshAgent,
         HostField::Forwards,
         HostField::ShellCommand,
     ];
@@ -334,7 +338,9 @@ impl HostField {
         match self {
             Self::Label | Self::Target | Self::Options | Self::Icon => HostSection::Connection,
             Self::CodexMode | Self::CodexEndpoint => HostSection::Codex,
-            Self::Clipboard | Self::Forwards | Self::ShellCommand => HostSection::Services,
+            Self::Clipboard | Self::SshAgent | Self::Forwards | Self::ShellCommand => {
+                HostSection::Services
+            }
         }
     }
 
@@ -347,6 +353,7 @@ impl HostField {
             Self::Forwards => "Port forwards",
             Self::Icon => "Icon",
             Self::Clipboard => "Clipboard",
+            Self::SshAgent => "SSH agent",
             Self::CodexMode => "Codex connection",
             Self::CodexEndpoint => "Codex endpoint",
         }
@@ -355,7 +362,7 @@ impl HostField {
     fn visible_for(self, row: &HostRow) -> bool {
         match self {
             Self::Forwards => !row.is_local && !row.is_socket && row.config().is_some(),
-            Self::Options | Self::ShellCommand => !row.is_local && !row.is_socket,
+            Self::Options | Self::ShellCommand | Self::SshAgent => !row.is_local && !row.is_socket,
             Self::CodexMode => row.codex.is_some(),
             Self::CodexEndpoint => row
                 .codex
@@ -845,6 +852,13 @@ impl App {
                 ),
                 Style::default(),
             );
+            if !row.is_socket {
+                append(
+                    &mut lines,
+                    format!("SSH agent {}", if row.forward_agent { "on" } else { "off" }),
+                    Style::default(),
+                );
+            }
             if !row.shell_command.text().trim().is_empty() {
                 append(&mut lines, row.shell_command.text().to_owned(), dim);
             }
@@ -1091,6 +1105,13 @@ impl App {
                     }
                     HostField::Clipboard => {
                         vec![vec![Span::raw(if r.clipboard { "[on]" } else { "[off]" })]]
+                    }
+                    HostField::SshAgent => {
+                        vec![vec![Span::raw(if r.forward_agent {
+                            "[on]"
+                        } else {
+                            "[off]"
+                        })]]
                     }
                     HostField::CodexMode => vec![vec![Span::raw(format!(
                         "[{}]",
@@ -1524,16 +1545,18 @@ impl App {
                     }
                     return None;
                 }
-                // The one field with no text in it, so the keys that would move a
-                // cursor have nothing to do and flip the value instead. `Enter`
-                // deliberately isn't one of them: it commits the row everywhere
-                // else in this form, and a key that means "save" on four fields
-                // must not mean "change" on the fifth.
+                // Toggle fields use Space or arrows; Enter commits the draft
+                // consistently across the whole form.
                 KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                    if focus == HostField::Clipboard && !ctrl && !alt =>
+                    if matches!(focus, HostField::Clipboard | HostField::SshAgent)
+                        && !ctrl
+                        && !alt =>
                 {
                     if let Some(r) = state.rows.get_mut(state.cursor) {
-                        r.clipboard = !r.clipboard;
+                        match focus {
+                            HostField::SshAgent => r.forward_agent = !r.forward_agent,
+                            _ => r.clipboard = !r.clipboard,
+                        }
                     }
                     return None;
                 }
@@ -1544,7 +1567,10 @@ impl App {
                 // toggle a setting or commit a draft.
                 if matches!(
                     focus,
-                    HostField::Clipboard | HostField::CodexMode | HostField::Forwards
+                    HostField::Clipboard
+                        | HostField::SshAgent
+                        | HostField::CodexMode
+                        | HostField::Forwards
                 ) {
                     return None;
                 }
@@ -1583,7 +1609,10 @@ impl App {
                 // Nothing to type into: its own keys are handled above, and a key
                 // none of them claim is dropped rather than falling through to a
                 // `TextInput` this field does not have.
-                HostField::Clipboard | HostField::CodexMode | HostField::Forwards => {}
+                HostField::Clipboard
+                | HostField::SshAgent
+                | HostField::CodexMode
+                | HostField::Forwards => {}
                 HostField::CodexEndpoint => {
                     r.codex_endpoint.handle_key(key);
                 }
@@ -1790,6 +1819,7 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
         // Name whose clipboard is offered, as well as the toggle key.
         HostField::Clipboard => Some("  Space toggle · offer the local clipboard"),
+        HostField::SshAgent => Some("  Space toggle · use the local SSH agent on this host"),
     }
 }
 

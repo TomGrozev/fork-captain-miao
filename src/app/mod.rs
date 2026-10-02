@@ -668,6 +668,7 @@ pub(in crate::app) enum HostTarget {
         /// Connection arguments after legacy forwarding options are migrated.
         options: Vec<String>,
         clipboard: bool,
+        forward_agent: bool,
     },
 }
 
@@ -2541,6 +2542,7 @@ impl App {
                         target: ssh.clone(),
                         options: h.options.clone(),
                         clipboard: h.clipboard,
+                        forward_agent: h.forward_agent,
                     },
                     (None, None) => return None,
                 };
@@ -2563,6 +2565,7 @@ impl App {
                 target,
                 options,
                 clipboard,
+                forward_agent,
             } => Transport::Ssh {
                 target: target.clone(),
                 // One short, OS-limit-safe local socket per host; ssh forwards
@@ -2574,6 +2577,7 @@ impl App {
                 options: options.clone(),
                 forwards,
                 clipboard: *clipboard,
+                forward_agent: *forward_agent,
             },
         };
         Backend::Remote(RemoteBackend::connect(transport, host))
@@ -2779,6 +2783,7 @@ impl App {
                 icon: picker::TextInput::with_text(h.icon.unwrap_or_default()),
                 disabled: h.disabled,
                 clipboard: h.clipboard,
+                forward_agent: h.forward_agent,
                 // Quote argv values so spaces survive reopening the editor.
                 options: picker::TextInput::with_text(shell_words::join(h.options)),
                 shell_command: picker::TextInput::with_text(h.shell_command.unwrap_or_default()),

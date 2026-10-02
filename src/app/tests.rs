@@ -6706,6 +6706,11 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
     d.press(KeyCode::Tab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::SshAgent)
+    );
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::ShellCommand)
     );
     d.press(KeyCode::Tab);
@@ -6713,6 +6718,7 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::Label)
     );
+    d.press(KeyCode::BackTab);
     d.press(KeyCode::BackTab);
     d.press(KeyCode::BackTab);
     d.press(KeyCode::BackTab);
@@ -6917,6 +6923,86 @@ fn work_tab_command_edits_apply_without_replacing_the_connection() {
     };
     let new = App::dialled_identities(&[changed], &Default::default());
     assert_eq!(App::plan_reconcile(&old, &new), vec![Some(0)]);
+}
+
+#[test]
+fn ssh_agent_toggle_reconnects_only_ssh_hosts() {
+    use super::hosts::HostConfig;
+    let host = HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        ..Default::default()
+    };
+    let identities = |h| App::dialled_identities(&[h], &Default::default());
+    let before = identities(host.clone());
+    let enabled = identities(HostConfig {
+        forward_agent: true,
+        ..host.clone()
+    });
+    assert_eq!(App::plan_reconcile(&before, &enabled), vec![None]);
+    assert_eq!(App::plan_reconcile(&enabled, &before), vec![None]);
+    let socket = HostConfig {
+        socket: Some("/tmp/example.sock".into()),
+        ..host
+    };
+    assert_eq!(
+        identities(socket.clone()),
+        identities(HostConfig {
+            forward_agent: true,
+            ..socket
+        })
+    );
+}
+
+#[test]
+fn ssh_agent_editor_toggles_saves_and_cancels() {
+    use super::{HostField, hosts::HostConfig};
+    let mut d = TestDashboard::new(120, 36);
+    d.app.open_host_edit_from(vec![HostConfig {
+        label: "example".into(),
+        ssh: Some("example-target".into()),
+        disabled: true,
+        ..Default::default()
+    }]);
+    let panel = d.app.host_edit.as_mut().unwrap();
+    panel.cursor = 1;
+    panel.begin_edit(HostField::SshAgent);
+    let output = d.render();
+    assert!(
+        output.contains("SSH agent") && output.contains("[off]"),
+        "{output}"
+    );
+    d.press_ctrl(KeyCode::Char(' '));
+    assert!(!d.app.host_edit.as_ref().unwrap().rows[1].forward_agent);
+    d.press(KeyCode::Char(' '));
+    assert!(d.app.host_edit.as_ref().unwrap().rows[1].forward_agent);
+    d.press(KeyCode::Esc);
+    assert!(!d.app.host_edit.as_ref().unwrap().rows[1].forward_agent);
+    d.app
+        .host_edit
+        .as_mut()
+        .unwrap()
+        .begin_edit(HostField::SshAgent);
+    d.press(KeyCode::Right);
+    d.press(KeyCode::Enter);
+    assert!(
+        d.app.host_edit.as_ref().unwrap().rows[1]
+            .config()
+            .unwrap()
+            .forward_agent
+    );
+    // Tab skips SSH-only settings for socket transports.
+    d.app.host_edit.as_mut().unwrap().rows[1].is_socket = true;
+    d.app
+        .host_edit
+        .as_mut()
+        .unwrap()
+        .begin_edit(HostField::Clipboard);
+    d.press(KeyCode::Tab);
+    assert_ne!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::SshAgent)
+    );
 }
 
 #[test]
@@ -7335,7 +7421,7 @@ fn wrapping_a_field_value_tiles_the_text_exactly() {
     assert_eq!(wrap_ranges("", 10), vec![0..0]);
 }
 
-/// The row editor's four fields walk by every idiom the dashboard binds
+/// The row editor's fields walk by every idiom the dashboard binds
 /// elsewhere, and — the point — they walk **backwards** too. `Tab`-only meant
 /// overshooting Options cost three more presses.
 #[test]
@@ -7358,6 +7444,8 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
     d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(Clipboard));
     d.press(KeyCode::Tab);
+    assert_eq!(focus(&d), Some(SshAgent));
+    d.press(KeyCode::Tab);
     assert_eq!(focus(&d), Some(ShellCommand));
     // The form is a ring, so the last field steps to the first.
     d.press(KeyCode::Tab);
@@ -7365,6 +7453,8 @@ fn the_hosts_panel_walks_its_fields_in_both_directions() {
 
     d.press(KeyCode::BackTab);
     assert_eq!(focus(&d), Some(ShellCommand));
+    d.press(KeyCode::BackTab);
+    assert_eq!(focus(&d), Some(SshAgent));
     d.press(KeyCode::BackTab);
     assert_eq!(focus(&d), Some(Clipboard));
     d.press(KeyCode::Up);
@@ -9708,6 +9798,7 @@ fn only_a_changed_connection_string_reconnects() {
         forwards: Vec::new(),
         clipboard: false,
         shell_command: None,
+        forward_agent: false,
     };
     let none = HashSet::new();
     let ids = |hosts: &[HostConfig]| App::dialled_identities(hosts, &none);
@@ -9730,6 +9821,7 @@ fn only_a_changed_connection_string_reconnects() {
             forwards: Vec::new(),
             clipboard: false,
             shell_command: None,
+            forward_agent: false,
         }])
     );
     // A port forward is part of the ssh child's argv, so changing the set has to
@@ -9795,6 +9887,7 @@ fn reconciling_hosts_touches_only_the_hosts_that_changed() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard: false,
+        forward_agent: false,
         shell_command: None,
     };
     let none = HashSet::new();
@@ -9843,6 +9936,7 @@ fn the_clipboard_server_runs_only_when_a_host_wants_it() {
         options: Vec::new(),
         forwards: Vec::new(),
         clipboard,
+        forward_agent: false,
         shell_command: None,
     };
     assert!(!App::any_host_wants_clipboard(&[]));

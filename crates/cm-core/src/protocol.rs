@@ -117,12 +117,18 @@ pub enum ClientFrame {
         req_id: u64,
         cwd: String,
         push: bool,
+        /// Agent socket belonging to this dashboard's current SSH session.
+        /// Empty explicitly clears an unavailable agent; absent inherits host auth.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_auth_sock: Option<String>,
     },
     /// Execute only if the confirmed checkout and destination still match.
     RunVcs {
         req_id: u64,
         cwd: String,
         plan: Box<crate::vcs::VcsPlan>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_auth_sock: Option<String>,
     },
     /// A frame this build doesn't know — a *newer* peer's addition. Decoded
     /// rather than erroring, so the connection survives; the handler ignores it.
@@ -310,6 +316,21 @@ fn invalid(msg: &str) -> std::io::Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn old_git_requests_inherit_host_authentication() {
+        for frame in [
+            serde_json::json!({"frame": "PrepareVcs", "req_id": 1, "cwd": "~/project", "push": false}),
+            serde_json::json!({"frame": "RunVcs", "req_id": 2, "cwd": "~/project", "plan": crate::vcs::VcsPlan::for_test(true)}),
+        ] {
+            let request: ClientFrame = serde_json::from_value(frame).unwrap();
+            match request {
+                ClientFrame::PrepareVcs { ssh_auth_sock, .. }
+                | ClientFrame::RunVcs { ssh_auth_sock, .. } => assert!(ssh_auth_sock.is_none()),
+                _ => panic!("expected a Git request"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn client_frames_round_trip_and_eof() {
         let frames = vec![
@@ -322,11 +343,13 @@ mod tests {
                 req_id: 10,
                 cwd: "~/project".into(),
                 push: true,
+                ssh_auth_sock: Some("/tmp/ssh-example/agent.sock".into()),
             },
             ClientFrame::RunVcs {
                 req_id: 11,
                 cwd: "~/project".into(),
                 plan: Box::new(crate::vcs::VcsPlan::for_test(true)),
+                ssh_auth_sock: None,
             },
             ClientFrame::ListResumable {
                 req_id: 7,

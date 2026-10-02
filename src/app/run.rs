@@ -243,6 +243,7 @@ fn prepare_vcs_command(
                             req_id,
                             cwd: cwd.clone(),
                             push,
+                            ssh_auth_sock: remote.vcs_ssh_auth_sock(),
                         }
                     })
                     .await
@@ -405,6 +406,7 @@ fn start_vcs_command(
                         req_id,
                         cwd: cwd.clone(),
                         plan,
+                        ssh_auth_sock: remote.vcs_ssh_auth_sock(),
                     }
                 })
                 .await;

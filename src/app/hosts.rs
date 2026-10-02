@@ -72,6 +72,9 @@ pub(super) struct HostConfig {
     /// dies with the connection exactly like a user-typed forward.
     #[serde(default)]
     pub clipboard: bool,
+    /// Forward the dashboard's SSH agent to this SSH host, including Git RPCs.
+    #[serde(default)]
+    pub forward_agent: bool,
 }
 
 impl HostConfig {
@@ -151,6 +154,22 @@ pub(super) fn resolve_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_agent_forwarding_is_opt_in_and_persisted() {
+        let old: HostConfig = serde_json::from_value(serde_json::json!({
+            "label": "example", "ssh": "example-target",
+        }))
+        .unwrap();
+        assert!(!old.forward_agent);
+        let enabled = HostConfig {
+            forward_agent: true,
+            ..old
+        };
+        let restored: HostConfig =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert!(restored.forward_agent);
+    }
 
     #[test]
     fn shell_command_is_optional_and_round_trips_without_losing_quotes() {
