@@ -2805,6 +2805,9 @@ impl App {
         self.host_edit = Some(HostEditState {
             message: None,
             cursor: 0,
+            view: host_edit::HostView::List,
+            detail_scroll: 0,
+            detail_rows: 0,
             edit: None,
             pending_remove: None,
             pending_upgrade: None,

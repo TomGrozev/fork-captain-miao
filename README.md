@@ -482,11 +482,16 @@ dropped connection or a slept laptop detaches windows without touching the
 sessions, and reconnecting brings them back. Full design notes:
 [docs/remote-sessions.md](docs/remote-sessions.md).
 
-The panel is where each host reports in: connection state and the reason when it
-failed, session counts, daemon version, latency, and CPU, memory, and disk usage.
-Disk measures space used on the host's home filesystem. All three percentages
-use the attention color at 80% and the error color at 90% (yellow and red by
-default). `l` opens its full connection log, `c` suspends it, `u` upgrades its server.
+The panel lists host, connection state, session count, CPU, memory, disk, and
+latency in aligned columns. Disk measures space used on the host's home
+filesystem. All three percentages use the attention color at 80% and the error
+color at 90% (yellow and red by default). `Enter` opens details, including full
+failure messages, connection settings, and the daemon version. `e` edits the
+host in Connection, Codex, and Services tabs; `Alt+1/2/3` switches tabs and Tab
+walks their fields. Enter applies edits and Escape cancels the entire draft.
+`J`/`K` reorder hosts; the first usable host is the default for new sessions.
+`?` shows host commands, including `l` for the connection log, `c` to suspend or
+reconnect, `f` for port forwards, and `u` to upgrade the server when available.
 
 - **Detached rows** — running there, no window here — are dimmed and marked 🙈
   when free or 👀 when another client is holding one. `Enter` attaches, `Space A`

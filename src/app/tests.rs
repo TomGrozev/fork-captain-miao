@@ -6059,6 +6059,322 @@ fn format_coarse_age_has_minute_resolution() {
 // The hosts panel: connection log and ssh options
 // =============================================================================
 
+fn host_panel_with_readings(width: u16, height: u16) -> TestDashboard {
+    use crate::backend::{Backend, ConnState, RemoteBackend};
+    use crate::state::HostId;
+    use cm_core::vitals::HostVitals;
+    let mut d = TestDashboard::new(width, height);
+    d.app.open_host_edit_from(
+        ["build", "gpu", "test", "archive"]
+            .into_iter()
+            .map(|name| super::hosts::HostConfig {
+                label: name.into(),
+                ssh: Some("test-target".into()),
+                disabled: name == "archive",
+                ..Default::default()
+            })
+            .collect(),
+    );
+    for (name, cpu, memory, disk) in [
+        ("build", 34.0, 61, 47),
+        ("gpu", 86.0, 73, 92),
+        ("test", 0.0, 0, 0),
+    ] {
+        let host = HostId(name.into());
+        let remote = RemoteBackend::unconnected_for_tests(host.clone(), Vec::new());
+        remote.simulate_link_for_tests(
+            if name == "test" {
+                ConnState::Failed("SSH connection timed out.\nCheck the target and network.".into())
+            } else {
+                ConnState::Connected
+            },
+            true,
+        );
+        remote.simulate_vitals_for_tests(
+            Some(HostVitals {
+                cpu_percent: Some(cpu),
+                mem_used_bytes: Some(memory),
+                mem_total_bytes: Some(100),
+                disk_used_bytes: Some(disk),
+                disk_available_bytes: Some(100 - disk),
+            }),
+            Some(std::time::Duration::from_millis(if name == "gpu" {
+                38
+            } else {
+                24
+            })),
+        );
+        d.app.backends.push(Backend::Remote(remote));
+    }
+    d.set_sessions(
+        (1..=5)
+            .map(|pid| {
+                let mut s = session(pid, "/work/project", SessionStatus::Idle);
+                s.host = HostId("build".into());
+                s
+            })
+            .collect(),
+    );
+    d.app.host_edit.as_mut().unwrap().cursor = 1;
+    d
+}
+
+#[test]
+fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
+    use unicode_width::UnicodeWidthStr;
+    for (width, height) in [(100, 28), (80, 24), (60, 22)] {
+        let mut d = host_panel_with_readings(width, height);
+        let out = d.render();
+        let header = out
+            .lines()
+            .find(|line| line.contains("HOST") && line.contains("STATE"))
+            .unwrap();
+        let headings: Vec<_> = header[header.find("HOST").unwrap()..]
+            .split('│')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                "HOST",
+                "STATE",
+                if width == 60 { "SES" } else { "SESS" },
+                "CPU",
+                "MEM",
+                "DISK",
+                "LATENCY"
+            ]
+        );
+        let build = out
+            .lines()
+            .find(|line| line.contains("build") && line.contains("34%"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(build.contains("5"), "{out}");
+        // The heading and numeric values end in the same terminal cell.
+        for (heading, value) in [
+            ("SES", "5"),
+            ("CPU", "34%"),
+            ("MEM", "61%"),
+            ("DISK", "47%"),
+            ("LATENCY", "24 ms"),
+        ] {
+            let label = if heading == "SES" && width != 60 {
+                "SESS"
+            } else {
+                heading
+            };
+            let header_end = header[..header.find(label).unwrap() + label.len()].width();
+            let value_end = build[..build.find(value).unwrap() + value.len()].width();
+            assert_eq!(
+                header_end, value_end,
+                "{heading} alignment at {width}: {out}"
+            );
+        }
+        let failure = out
+            .lines()
+            .find(|line| line.contains("test") && line.contains("failed"))
+            .unwrap();
+        assert_eq!(
+            failure.chars().filter(|c| *c == '—').count(),
+            5,
+            "offline values must not look like zero"
+        );
+        assert!(out.lines().any(|line| line.contains("archive")
+            && (line.contains("paused") || line.contains("suspended"))));
+        for hidden in [
+            "test-target",
+            "Codex:",
+            "attached",
+            "first = default",
+            "first is default",
+        ] {
+            assert!(
+                !out.contains(hidden),
+                "{hidden} must stay out of the compact list: {out}"
+            );
+        }
+        let buf = d.terminal.backend().buffer();
+        let (x, y) = find_cell(buf, "92%").unwrap();
+        assert_eq!(buf[(x, y)].fg, crate::config::get().colors.ui.error_fg);
+        let (x, y) = find_cell(buf, "86%").unwrap();
+        assert_eq!(buf[(x, y)].fg, crate::config::get().colors.ui.attention_fg);
+    }
+}
+
+#[test]
+fn host_list_distinguishes_loading_unavailable_and_partial_readings() {
+    use crate::backend::Backend;
+    use cm_core::vitals::HostVitals;
+    let mut d = host_panel_with_readings(80, 24);
+    let Backend::Remote(remote) = d
+        .app
+        .backend_for(&crate::state::HostId("build".into()))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let remote = remote.clone();
+    remote.simulate_vitals_for_tests(None, None);
+    let out = d.render();
+    let row = out
+        .lines()
+        .find(|line| line.contains("build") && line.contains("connected"))
+        .unwrap();
+    assert_eq!(row.matches("n/a").count(), 4);
+    remote.simulate_vitals_for_tests(
+        Some(HostVitals {
+            cpu_percent: Some(f32::NAN),
+            mem_used_bytes: Some(50),
+            mem_total_bytes: Some(100),
+            ..Default::default()
+        }),
+        Some(std::time::Duration::from_millis(12)),
+    );
+    let out = d.render();
+    let row = out
+        .lines()
+        .find(|line| line.contains("build") && line.contains("connected"))
+        .unwrap();
+    assert_eq!(row.matches("n/a").count(), 2);
+    assert!(row.contains("50%") && row.contains("12 ms"));
+    d.app
+        .backend_for(&crate::state::HostId("build".into()))
+        .unwrap()
+        .invalidate_vitals();
+    let out = d.render();
+    let row = out
+        .lines()
+        .find(|line| line.contains("build") && line.contains("connected"))
+        .unwrap();
+    assert!(
+        !row.contains('%') && !row.contains("12 ms"),
+        "stale readings must disappear: {out}"
+    );
+    assert!(d.app.vitals_spinner_phase().is_some());
+}
+
+#[test]
+fn host_details_help_and_nested_views_keep_modal_ownership() {
+    use super::host_edit::HostView;
+    let mut d = host_panel_with_readings(80, 24);
+    d.press(KeyCode::Enter);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
+    let out = d.render();
+    assert!(
+        out.contains("ssh test-target") && out.contains("CPU 34%"),
+        "{out}"
+    );
+    assert!(d.app.host_edit.as_ref().unwrap().edit.is_none());
+    d.press(KeyCode::Char('?'));
+    assert!(d.render().contains("Host commands"));
+    let order = d.app.host_edit.as_ref().unwrap().host_order();
+    for key in ['d', 'c', 'J', 'a', 'e', 'l', 'f'] {
+        d.press(KeyCode::Char(key));
+    }
+    let panel = d.app.host_edit.as_ref().unwrap();
+    assert_eq!(panel.host_order(), order);
+    assert!(
+        panel.pending_remove.is_none()
+            && panel.edit.is_none()
+            && panel.log_view.is_none()
+            && panel.forward_view.is_none()
+    );
+    d.press(KeyCode::Esc);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
+    d.press(KeyCode::Char('l'));
+    d.press(KeyCode::Esc);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
+    d.press(KeyCode::Char('e'));
+    d.press(KeyCode::Char('X'));
+    d.press(KeyCode::Esc);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[1].label.text(),
+        "build"
+    );
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
+    d.press(KeyCode::Char('J'));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().host_order(),
+        order,
+        "details must not reorder hidden rows"
+    );
+    d.press(KeyCode::Esc);
+    assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::List);
+    d.app.host_edit.as_mut().unwrap().cursor = 3;
+    assert!(!d.render().contains("SSH connection timed out"));
+    d.press(KeyCode::Enter);
+    let out = d.render();
+    assert!(
+        out.contains("SSH connection timed out.") && out.contains("Check the target and network."),
+        "{out}"
+    );
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Esc);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().view,
+        HostView::Details,
+        "cancel removal returns to details"
+    );
+    for row in &mut d.app.host_edit.as_mut().unwrap().rows {
+        if !row.is_local {
+            row.disabled = true;
+        }
+    }
+    d.press(KeyCode::Char('d'));
+    d.press(KeyCode::Char('y'));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().view,
+        HostView::List,
+        "removing the inspected row returns to the list"
+    );
+}
+
+#[test]
+fn host_editor_tabs_hide_other_settings_and_cancel_the_entire_draft() {
+    use super::HostField;
+    use cm_core::agents::codex::{CodexConfig, CodexMode};
+    let mut d = TestDashboard::new(80, 24);
+    d.app.open_host_edit_from(Vec::new());
+    let panel = d.app.host_edit.as_mut().unwrap();
+    let mut row = host_row("build", "");
+    row.codex = Some(CodexConfig::default());
+    row.codex_endpoint.set_text("unix://");
+    panel.rows.push(row);
+    panel.cursor = 1;
+    d.press(KeyCode::Char('e'));
+    assert!(d.render().contains("[1 Connection]"));
+    assert!(!d.render().contains("Codex connection") && !d.render().contains("Clipboard"));
+    d.press(KeyCode::Char('X'));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::CodexMode)
+    );
+    let out = d.render();
+    assert!(out.contains("[2 Codex]") && !out.contains("Target") && !out.contains("Clipboard"));
+    d.press(KeyCode::Char(' '));
+    assert!(d.render().contains("Codex endpoint"));
+    d.app
+        .handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::Clipboard)
+    );
+    let out = d.render();
+    assert!(
+        out.contains("[3 Services]") && !out.contains("Codex endpoint") && !out.contains("Target")
+    );
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Esc);
+    let row = &d.app.host_edit.as_ref().unwrap().rows[1];
+    assert_eq!(row.label.text(), "build");
+    assert!(!row.clipboard);
+    assert_eq!(row.codex.as_ref().unwrap().mode, CodexMode::Native);
+}
+
 #[test]
 fn host_order_migrates_the_old_default_and_normalizes_saved_labels() {
     use super::hosts::{HostConfig, resolve_order};
@@ -6124,7 +6440,7 @@ fn host_order_follows_reordering_in_the_panel_and_both_pickers() {
         })
         .collect();
     d.app.open_host_edit_from(configs.clone());
-    assert!(d.render().contains("first is default"));
+    assert!(!d.render().contains("first is default"));
     assert!(d.render().contains("reorder"));
     // Move localhost below both remotes; the backend at index zero must stay
     // untouched, and no real dial may replace the simulated connections.
@@ -6167,7 +6483,7 @@ fn host_order_follows_reordering_in_the_panel_and_both_pickers() {
     d.press(KeyCode::Char('K'));
     assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 0);
     // Uppercase letters belong to the text field while editing.
-    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char('e'));
     d.press(KeyCode::Char('J'));
     assert_eq!(d.app.host_edit.as_ref().unwrap().cursor, 0);
     d.press(KeyCode::Esc);
@@ -6221,7 +6537,7 @@ fn host_order_keeps_the_selected_row_visible_in_a_long_list() {
     d.app.open_host_edit_from(
         (0..15)
             .map(|i| super::hosts::HostConfig {
-                label: format!("test-host-{i}"),
+                label: format!("h{i}"),
                 ssh: Some("test-target".into()),
                 ..Default::default()
             })
@@ -6231,7 +6547,12 @@ fn host_order_keeps_the_selected_row_visible_in_a_long_list() {
         d.press(KeyCode::Char('J'));
     }
     let rendered = d.render();
-    assert!(rendered.contains("localhost"), "{rendered}");
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.contains("local") && line.contains("connected")),
+        "{rendered}"
+    );
     assert!(d.app.host_edit.as_ref().unwrap().rows[15].is_local);
     d.press(KeyCode::Down);
     assert!(d.render().contains("+ add host"));
@@ -6240,7 +6561,7 @@ fn host_order_keeps_the_selected_row_visible_in_a_long_list() {
     for _ in 0..16 {
         d.press(KeyCode::Up);
     }
-    assert!(d.render().contains("test-host-0"));
+    assert!(d.render().contains("h0"));
     assert!(d.app.host_edit.as_ref().unwrap().message.is_none());
 }
 
@@ -6263,7 +6584,7 @@ fn host_order_survives_rename_and_removing_the_default_promotes_the_next_row() {
         d.app.default_host_or_local().is_local(),
         "a suspended default falls back to this machine"
     );
-    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char('e'));
     d.press_ctrl(KeyCode::Char('u'));
     for c in "renamed".chars() {
         d.press(KeyCode::Char(c));
@@ -6302,11 +6623,11 @@ fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
     assert!(d.app.host_edit.as_ref().unwrap().pending_remove.is_none());
     assert!(!d.app.host_edit.as_ref().unwrap().rows[0].disabled);
     let rendered = d.render();
-    assert!(rendered.contains("localhost"));
+    assert!(rendered.contains("local"));
     assert!(!rendered.contains("connect/disconnect"));
     assert!(!rendered.contains("delete"));
 
-    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char('e'));
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(super::HostField::CodexMode)
@@ -6332,7 +6653,7 @@ fn localhost_is_permanent_and_edits_the_execution_hosts_codex_policy() {
             .mode,
         CodexMode::Native
     );
-    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char('e'));
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Tab);
     assert_eq!(
@@ -6368,8 +6689,8 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
     row.codex_endpoint.set_text("unix://");
     panel.rows.push(row);
     panel.cursor = panel.rows.len() - 1;
-    d.press(KeyCode::Enter);
-    for _ in 0..5 {
+    d.press(KeyCode::Char('e'));
+    for _ in 0..4 {
         d.press(KeyCode::Tab);
     }
     assert_eq!(
@@ -6380,6 +6701,11 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
     d.press(KeyCode::Tab);
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
+        Some(HostField::Clipboard)
+    );
+    d.press(KeyCode::Tab);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::ShellCommand)
     );
     d.press(KeyCode::Tab);
@@ -6387,6 +6713,7 @@ fn remote_host_editor_exposes_codex_only_after_the_host_reports_support() {
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(HostField::Label)
     );
+    d.press(KeyCode::BackTab);
     d.press(KeyCode::BackTab);
     d.press(KeyCode::BackTab);
     assert_eq!(
@@ -6480,7 +6807,7 @@ fn the_hosts_panel_configures_a_hosts_ssh_options() {
     // Shown as typed: this field has no grammar of its own to canonicalise to.
     let out = d.render();
     assert!(
-        out.contains("ssh user@box -C -L 8080:localhost:3000"),
+        out.contains("[ssh] user@box") && out.contains("-C -L 8080:localhost:3000"),
         "{out}"
     );
 
@@ -6729,44 +7056,32 @@ fn forwarding_list_scrolls_and_socket_hosts_hide_ssh_controls() {
     d.press(KeyCode::Esc);
     d.app.host_edit.as_mut().unwrap().rows[1].is_socket = true;
     assert!(!d.app.selected_host_has_forwards());
-    d.press(KeyCode::Enter);
+    d.press(KeyCode::Char('e'));
     let rendered = d.render();
     assert!(!rendered.contains("Advanced SSH options"));
     assert!(!rendered.contains("Port forwards"));
     assert!(!rendered.contains("Work tab command"));
 }
 
-/// A host offered the clipboard says so on its row.
-///
-/// The marker rides the *target* line rather than the status line because that is
-/// where a host's forwards are shown, and the clipboard is one more of them — the
-/// status line reports live connection state, which this is not. Without it the
-/// setting is invisible from the list, which is where you look to see how a host
-/// is configured.
+/// Configuration stays out of the compact list and is available on demand.
 #[test]
-fn a_host_offered_the_clipboard_shows_it_on_its_row() {
+fn clipboard_policy_is_shown_in_host_details() {
     let mut d = TestDashboard::new(120, 30);
-    d.app.open_host_edit();
-    // This fixture exercises remote rows; localhost is covered separately.
-    d.app.host_edit.as_mut().unwrap().rows.clear();
+    d.app.open_host_edit_from(Vec::new());
     let state = d.app.host_edit.as_mut().unwrap();
-    state.rows.push(host_row("box", "user@box"));
-    state.cursor = 0;
-
+    state.rows.push(host_row("box", "test-target"));
+    state.cursor = 1;
+    assert!(!d.render().contains("test-target"));
+    d.press(KeyCode::Enter);
     let out = d.render();
-    assert!(out.contains("ssh user@box"), "{out}");
-    assert!(!out.contains('\u{1f4cb}'), "off must show no marker: {out}");
-
-    d.app.host_edit.as_mut().unwrap().rows[0].clipboard = true;
-    let out = d.render();
-    assert!(
-        out.contains("ssh user@box \u{1f4cb}"),
-        "the marker belongs beside the target: {out}"
-    );
+    assert!(out.contains("ssh test-target"), "{out}");
+    assert!(out.contains("Clipboard off"), "{out}");
+    d.app.host_edit.as_mut().unwrap().rows[1].clipboard = true;
+    assert!(d.render().contains("Clipboard on"));
 }
 
 /// The clipboard is a **field**, not a panel key: it shows its own state in the
-/// editor, `Space` flips it, and `Esc` puts it back like any other field.
+/// Services tab, `Space` flips it, and `Esc` puts it back like any other field.
 ///
 /// The old `p` in the list was invisible until you read the footer and had no way
 /// to say what it currently was. Being a field, `[off]` is on screen the moment
@@ -6790,20 +7105,16 @@ fn the_clipboard_is_a_field_in_the_row_editor() {
     d.press(KeyCode::Char('p'));
     assert!(!row(&d), "`p` in the list must no longer toggle anything");
 
-    // Opening the editor shows the field and its state, unasked.
+    // The Services tab contains clipboard policy; Tab reaches it even when
+    // this host has no Codex settings to show.
     d.press(KeyCode::Char('e'));
-    let out = d.render();
-    assert!(
-        out.contains("Clipboard"),
-        "the field must be visible: {out}"
-    );
-    assert!(out.contains("[off]"), "and say what it currently is: {out}");
-
-    // Walk to it and flip it. `Space` on a text field would type a space, which
-    // is why the toggle is bound on this field alone.
+    assert!(!d.render().contains("Clipboard"));
     for _ in 0..4 {
         d.press(KeyCode::Tab);
     }
+    let out = d.render();
+    assert!(out.contains("Clipboard"), "{out}");
+    assert!(out.contains("[off]"), "{out}");
     assert_eq!(
         d.app.host_edit.as_ref().unwrap().focus(),
         Some(super::HostField::Clipboard)
@@ -6859,8 +7170,7 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     // This fixture exercises remote rows; localhost is covered separately.
     d.app.host_edit.as_mut().unwrap().rows.clear();
     let state = d.app.host_edit.as_mut().unwrap();
-    // Two lines each, so seven hosts fill the popup exactly — which is more than
-    // the old layout had room for once the form took the bottom eight rows.
+    // Seven compact host rows remain available behind the modal editor.
     for i in 1..=7 {
         state.rows.push(host_row(&format!("h{i}"), ""));
     }
@@ -6891,7 +7201,7 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
         let (x, y) = find_cell(buf, needle).unwrap_or_else(|| panic!("{needle} not drawn"));
         buf[(x, y)].style().add_modifier.contains(Modifier::DIM)
     };
-    assert!(dim_at("h1"), "the list must read as no longer listening");
+    assert!(dim_at("HOST"), "the list must read as no longer listening");
     assert!(!dim_at("Edit Host"), "the card itself must not");
 
     // The line the card holds for a per-field hint is held whether the focused
@@ -6908,10 +7218,16 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     }
     let hinted = d.render();
     assert!(hinted.contains("Space toggle"), "{hinted}");
+    assert!(
+        !quiet.contains("Clipboard"),
+        "inactive tabs stay out of the form"
+    );
+    d.press(KeyCode::Tab);
+    let quiet_service = d.render();
     assert_eq!(
-        row_of(&quiet, "Clipboard"),
+        row_of(&quiet_service, "Clipboard"),
         row_of(&hinted, "Clipboard"),
-        "the fields must not move when a hint appears"
+        "a field hint must not move fields in the same tab"
     );
 
     // A row the edit *created* says so, because there `Esc` drops it rather than
@@ -6966,7 +7282,14 @@ fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
         icon_row > opts_row + 1,
         "the field grows to show the full value"
     );
-    assert!(out.contains("Clipboard"), "the card still closes: {out}");
+    assert!(
+        out.contains("Icon"),
+        "the active section still closes: {out}"
+    );
+    assert!(
+        !out.contains("Clipboard"),
+        "inactive section stays hidden: {out}"
+    );
 }
 
 /// Wrapping a field under a cursor is not the same problem as wrapping a log

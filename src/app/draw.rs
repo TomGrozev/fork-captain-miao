@@ -566,10 +566,11 @@ impl App {
     ///
     /// [`connect_blink_phase`]: App::connect_blink_phase
     pub(super) fn vitals_spinner_phase(&self) -> Option<usize> {
-        let showing_rows = self
-            .host_edit
-            .as_ref()
-            .is_some_and(|s| s.log_view.is_none());
+        let showing_rows = self.host_edit.as_ref().is_some_and(|s| {
+            s.log_view.is_none()
+                && s.forward_view.is_none()
+                && !matches!(s.view, super::host_edit::HostView::Help { .. })
+        });
         if !showing_rows
             || !self
                 .backends
@@ -1814,74 +1815,7 @@ impl App {
                 spans.extend(hint_pair("Esc", "close"));
                 spans
             }
-            InputMode::HostEdit => {
-                let host_edit = self.host_edit.as_ref();
-                if host_edit.is_some_and(|h| h.forward_view.is_some()) {
-                    vec![Span::raw(self.forward_hints())]
-                } else if host_edit.is_some_and(|h| h.log_view.is_some()) {
-                    let mut spans = hint_pair("j/k", "scroll");
-                    spans.extend(hint_pair("g/G", "top/bottom"));
-                    spans.extend(hint_pair("Esc", "back"));
-                    spans
-                } else if host_edit.is_some_and(|h| h.edit.is_some()) {
-                    // `Esc cancel`, not the old `back`: it puts the row as it was
-                    // and Enter is what keeps the change, so the two keys have to
-                    // read as the opposites they now are.
-                    let mut spans = hint_pair("Tab/↑↓", "field");
-                    let local = host_edit
-                        .and_then(|h| h.rows.get(h.cursor))
-                        .is_some_and(|r| r.is_local);
-                    if !local {
-                        spans.extend(hint_pair("^t", "ssh/socket"));
-                        spans.extend(hint_pair("^e", "emoji"));
-                    }
-                    if host_edit.and_then(|h| h.focus()) == Some(super::HostField::Forwards) {
-                        spans.extend(hint_pair("Enter", "manage"));
-                    } else {
-                        spans.extend(hint_pair("Space", "toggle"));
-                        spans.extend(hint_pair("Enter", "save"));
-                    }
-                    spans.extend(hint_pair("Esc", "cancel"));
-                    spans
-                } else {
-                    // No `s save`: the panel has no Save step — every mutation
-                    // persists as it happens (§9) — and `Esc` closes rather than
-                    // cancelling anything, so both old hints named keys that do
-                    // not exist.
-                    let mut spans = hint_pair("a", "add");
-                    spans.extend(hint_pair("e", "edit"));
-                    if self.selected_host_has_forwards() {
-                        spans.extend(hint_pair("f", "forwards"));
-                    }
-                    if host_edit.is_some_and(|h| h.cursor < h.rows.len() && h.rows.len() > 1) {
-                        spans.extend(hint_pair("J/K", "reorder"));
-                    }
-                    // The two shortcuts into a *named* field, where `e` always
-                    // lands on Label. Only worth a hint for the fields you'd open
-                    // the editor specifically to change.
-                    let local = host_edit
-                        .and_then(|h| h.rows.get(h.cursor))
-                        .is_some_and(|r| r.is_local);
-                    if !local {
-                        spans.extend(hint_pair("^e", "icon"));
-                        spans.extend(hint_pair("^t", "target"));
-                        spans.extend(hint_pair("c", "connect/disconnect"));
-                        spans.extend(hint_pair("d", "delete"));
-                    }
-                    // Shown only on a row that has somewhere to go, which is the
-                    // same condition the row's `↑` marker draws under: a hint
-                    // for a key that would silently do nothing is worse than no
-                    // hint, and every other key here works on every row.
-                    if self.selected_host_upgrade().is_some() {
-                        spans.extend(hint_pair("u", "upgrade server"));
-                    }
-                    if self.selected_host_has_log() {
-                        spans.extend(hint_pair("l", "log"));
-                    }
-                    spans.extend(hint_pair("Esc", "close"));
-                    spans
-                }
-            }
+            InputMode::HostEdit => self.host_hints(area.width),
         };
         // Fill the whole footer row with the flat bar background; the hint spans
         // render on top, keys as `KEY_BG` pills and labels inheriting the bar.

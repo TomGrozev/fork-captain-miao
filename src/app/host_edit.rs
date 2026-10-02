@@ -12,7 +12,7 @@
 //! possible, and why it carries a snapshot rather than a flag.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
@@ -22,20 +22,23 @@ use crate::config;
 use crate::state::HostId;
 
 use super::draw::{one_line, vitals_spinner_glyph, wrap_ranges};
-use super::format::{ICON_SLOT_WIDTH, centered_rect, clear_overlay};
+use super::format::{ICON_SLOT_WIDTH, centered_rect, clear_overlay, hint_pair};
 use super::picker::{TextInput, TextInputEvent};
 use super::{Action, App};
 use super::{hosts, picker};
 
-/// Active hosts popup (`input_mode == InputMode::HostEdit`). A working copy of
-/// the host list edited in place; committed (and the backends rebuilt) on save,
-/// discarded on cancel.
+/// Active hosts popup (`input_mode == InputMode::HostEdit`). List and details
+/// share a selected row. Only a row editor carries uncommitted changes; Enter
+/// applies that draft and Escape restores its snapshot.
 #[derive(Debug)]
 pub(crate) struct HostEditState {
     pub(in crate::app) rows: Vec<HostRow>,
     pub(in crate::app) message: Option<String>,
     /// Selected row (`0..rows.len()`), or `rows.len()` for the "+ add" line.
     pub(in crate::app) cursor: usize,
+    pub(in crate::app) view: HostView,
+    pub(in crate::app) detail_scroll: usize,
+    pub(in crate::app) detail_rows: usize,
     /// `Some` while the selected row's fields have the keyboard — see
     /// [`RowEdit`]. `None` in the list. Drawn as a card over the list rather
     /// than inside it, so this is what dims the panel behind it too.
@@ -53,6 +56,35 @@ pub(crate) struct HostEditState {
     /// show is what didn't fit on a row.
     pub(in crate::app) log_view: Option<HostLogView>,
     pub(in crate::app) forward_view: Option<super::port_forwards::ForwardView>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::app) enum HostView {
+    #[default]
+    List,
+    Details,
+    Help {
+        from_details: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostSection {
+    Connection,
+    Codex,
+    Services,
+}
+
+impl HostSection {
+    const ALL: [Self; 3] = [Self::Connection, Self::Codex, Self::Services];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection",
+            Self::Codex => "Codex",
+            Self::Services => "Services",
+        }
+    }
 }
 
 /// The hosts panel's row editor: which field has the keyboard, and what `Esc`
@@ -220,8 +252,8 @@ pub(crate) struct HostRow {
     /// A form field, toggled with `Space`: the panel's plain letters are for
     /// things you do *to* a row (connect, delete, upgrade), and this is part of
     /// what a host **is**, like its options. Being a field also means it shows its
-    /// own state — `[off]` is visible the moment the editor opens, where a list
-    /// key was only discoverable from the footer.
+    /// own state — `[off]` is visible in Services, where a list key was only
+    /// discoverable from the footer.
     pub(in crate::app) clipboard: bool,
 }
 
@@ -284,24 +316,27 @@ pub(crate) enum HostField {
 }
 
 impl HostField {
-    /// Form order — the order the fields are drawn in, which is the order the
-    /// focus keys walk, and what the editor's card measures itself from: the
-    /// widest hint over these fields sets its width and the count sets its
-    /// height, so a sixth field changes the box without anyone resizing it.
-    ///
-    /// New fields follow the original Label, Target, Options, Icon and Clipboard
-    /// fields so their familiar Tab positions stay the same.
+    /// Form order. Tab walks all supported fields in section order, switching
+    /// tabs as needed; each tab renders only its own fields.
     const ORDER: [HostField; 9] = [
         HostField::Label,
         HostField::Target,
         HostField::Options,
         HostField::Icon,
-        HostField::Clipboard,
         HostField::CodexMode,
         HostField::CodexEndpoint,
+        HostField::Clipboard,
         HostField::Forwards,
         HostField::ShellCommand,
     ];
+
+    fn section(self) -> HostSection {
+        match self {
+            Self::Label | Self::Target | Self::Options | Self::Icon => HostSection::Connection,
+            Self::CodexMode | Self::CodexEndpoint => HostSection::Codex,
+            Self::Clipboard | Self::Forwards | Self::ShellCommand => HostSection::Services,
+        }
+    }
 
     fn label(self) -> &'static str {
         match self {
@@ -354,126 +389,90 @@ fn utilisation_style(percent: f32, ui: &config::UiColors) -> Style {
     }
 }
 
-fn vitals_spans(vitals: cm_core::vitals::HostVitals, ui: &config::UiColors) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    if !vitals.is_empty() {
-        for (label, percent) in [
-            ("cpu", vitals.cpu_percent),
-            ("mem", vitals.mem_percent()),
-            ("disk", vitals.disk_percent()),
-        ] {
-            spans.push(Span::styled(format!("  {label} "), Style::default().dim()));
-            spans.push(match percent.filter(|value| value.is_finite()) {
-                Some(value) => Span::styled(format!("{value:.0}%"), utilisation_style(value, ui)),
-                None => Span::styled("n/a", Style::default().dim()),
-            });
-        }
-    }
-    spans
-}
-
 impl App {
-    /// The live status spans for one host row in the panel: connection state
-    /// (green when connected, the `Failed` reason verbatim when there is one),
-    /// running/attached session counts, the daemon version from `Welcome`, and
-    /// the opportunistic latency sample. A host that isn't connected yet — or
-    /// isn't in the backend set at all (a row the user is still typing) — shows
-    /// only what's known.
-    fn host_status_spans(&self, host: &HostId, max_width: usize) -> Vec<Span<'static>> {
+    /// The list contains only comparable values. Narrative and configuration
+    /// belong to the details view, so a long target cannot crowd out readings.
+    fn host_list_values(&self, row: &HostRow, narrow: bool) -> [Span<'static>; 6] {
         let cfg = config::get();
         let ui = &cfg.colors.ui;
-        let Some(backend) = self.backend_for(host) else {
-            return vec![Span::styled(
-                "not connected".to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            )];
+        let dim = Style::default().dim();
+        let missing = || Span::styled("—", dim);
+        let backend = self.backend_for(&row.host()).filter(|_| !row.disabled);
+        let connection = backend.map(|b| b.conn_state());
+        let (label, style) = if row.disabled {
+            (if narrow { "paused" } else { "suspended" }, dim)
+        } else {
+            match connection {
+                Some(ConnState::Connected) => (
+                    if narrow { "up" } else { "connected" },
+                    Style::default().fg(Color::Green),
+                ),
+                Some(ConnState::Connecting) => (if narrow { "dialing" } else { "connecting" }, dim),
+                Some(ConnState::Failed(_)) => ("failed", Style::default().fg(ui.error_fg)),
+                _ => (if narrow { "down" } else { "offline" }, dim),
+            }
         };
-        let state = backend.conn_state();
-        let style = match &state {
-            ConnState::Connected => Style::default().fg(Color::Green),
-            ConnState::Connecting => Style::default().add_modifier(Modifier::DIM),
-            ConnState::Disconnected | ConnState::Failed(_) => Style::default().fg(ui.attention_fg),
+        let mut values = [
+            Span::styled(label, style),
+            missing(),
+            missing(),
+            missing(),
+            missing(),
+            missing(),
+        ];
+        let Some(backend) = backend.filter(|b| b.conn_state().is_connected()) else {
+            return values;
         };
-        let mut spans = vec![Span::styled(one_line(state.label(), max_width), style)];
-        if state.is_connected() {
-            let (running, attached) = self.host_session_counts(host);
-            // Keep utilisation before the dim annotations so high readings
-            // remain visible even when the panel clips a long host row.
-            let dim = Style::default().add_modifier(Modifier::DIM);
-            let mut trailer = format!(
-                "  {running} {}, {attached} attached",
-                super::plural_sessions(running)
-            );
-            if let Some(v) = backend.daemon_version() {
-                trailer.push_str(&format!("  v{v}"));
-                match backend.upgrade_offer() {
-                    // A restart here would genuinely land on something else, so
-                    // name what — the offer is only worth reading if it says
-                    // where it goes.
-                    Some(o) => trailer.push_str(&format!(" \u{2191}{}", o.version)),
-                    // The cost of preferring a host's own server on protocol
-                    // compatibility rather than version equality: a stale one
-                    // outlives our upgrades silently, and the digest marker that
-                    // refreshes the *cache* path never applies to a PATH install.
-                    // Stated here rather than left to be discovered — but as an
-                    // annotation, since it usually works fine, and *without* an
-                    // upgrade arrow, because there is nothing we could deploy
-                    // that this host would then choose.
-                    None if super::format::version_is_older(&v, env!("CARGO_PKG_VERSION")) => {
-                        trailer.push_str(" (older than ours)");
-                    }
-                    None => {}
+        values[1] = Span::raw(self.host_session_counts(&row.host()).0.to_string());
+        match backend.vitals() {
+            Some(VitalsView::Reading(vitals)) => {
+                for (index, percent) in [
+                    vitals.cpu_percent,
+                    vitals.mem_percent(),
+                    vitals.disk_percent(),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    values[index + 2] = match percent.filter(|value| value.is_finite()) {
+                        Some(value) => {
+                            Span::styled(format!("{value:.0}%"), utilisation_style(value, ui))
+                        }
+                        None => Span::styled("n/a", dim),
+                    };
+                }
+                if let Some(rtt) = backend.latency() {
+                    values[5] = Span::raw(format!("{} ms", rtt.as_millis()));
                 }
             }
-            // What the host says about itself, beside what the link says about
-            // it: utilisation answers "does this box have room for another
-            // session?", which is the other half of the question the latency
-            // starts. Percentages rather than absolutes because the row is a
-            // scannable line, not a monitor — `l` is where detail goes.
-            //
-            // These numbers stand or fall together, and none of them is ever
-            // a held one (see [`VitalsView`]): they arrive with a reading — the
-            // poll refreshes the latency sample on its way through — and until
-            // one does, a spinner sits in their place. A row that has none
-            // coming (a local backend, a host that isn't connected) shows
-            // neither, spinner included.
-            match backend.vitals() {
-                Some(VitalsView::Reading(v)) => {
-                    spans.extend(vitals_spans(v, ui));
-                    if let Some(rtt) = backend.latency() {
-                        trailer.push_str(&format!("  latency {}ms", rtt.as_millis()));
-                    }
+            Some(VitalsView::Loading) => {
+                for value in &mut values[2..] {
+                    *value = Span::styled(vitals_spinner_glyph(), dim);
                 }
-                // A frame of the spinner, which the run loop keeps turning. The
-                // wait is a round trip, so what this really says is "asked" —
-                // and on a host that has stopped answering it turns until the
-                // poll's deadline hands it to the arm below.
-                Some(VitalsView::Loading) => {
-                    spans.push(Span::styled(format!("  {}", vitals_spinner_glyph()), dim));
-                }
-                // Said rather than left blank, and in the attention colour: the
-                // host is connected and everything else about it is on the row,
-                // so numbers quietly missing reads as "nothing worth mentioning"
-                // rather than "we asked and got nothing back".
-                Some(VitalsView::Unavailable) => {
-                    spans.push(Span::styled(
-                        "  cpu/mem/disk unavailable".to_string(),
-                        Style::default().fg(ui.attention_fg),
-                    ));
-                }
-                None => {}
             }
-            if !trailer.is_empty() {
-                spans.push(Span::styled(trailer, dim));
+            Some(VitalsView::Unavailable) => {
+                for value in &mut values[2..] {
+                    *value = Span::styled("n/a", Style::default().fg(ui.attention_fg));
+                }
             }
+            None => {}
         }
-        spans
+        if row.is_local {
+            values[5] = Span::styled("local", dim);
+        }
+        values
     }
 
-    /// The hosts popup's geometry, as a percentage of the frame. Shared by the
-    /// list and by the row-editor card that floats inside it — the card insets
-    /// from *this*, so neither can drift off the other's edge.
-    const HOSTS_POPUP: (u16, u16) = (72, 60);
+    fn hosts_popup(area: Rect) -> Rect {
+        let width = area.width.saturating_sub(6).min(72);
+        let height = area.height.saturating_sub(2).min(18);
+        Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        )
+    }
 
     /// The hosts popup: the host list, or — while `l` is open — one host's
     /// connection log in its place. The row editor is a card over the list
@@ -487,8 +486,13 @@ impl App {
         } else if state.log_view.is_some() {
             self.draw_host_log(frame, area);
         } else {
-            self.draw_host_list(frame, area);
+            match state.view {
+                HostView::List => self.draw_host_list(frame, area),
+                HostView::Details => self.draw_host_details(frame, area),
+                HostView::Help { .. } => self.draw_host_help(frame, area),
+            }
             self.draw_host_form(frame, area);
+            self.draw_host_prompt(frame, area);
         }
     }
 
@@ -564,159 +568,403 @@ impl App {
         let Some(state) = self.host_edit.as_ref() else {
             return;
         };
-        let popup = centered_rect(Self::HOSTS_POPUP.0, Self::HOSTS_POPUP.1, area);
+        let popup = Self::hosts_popup(area);
         clear_overlay(frame, popup);
-        // No key hints on the border: the footer bar already renders this
-        // mode's bindings, and two copies of the same list disagree eventually.
-        let block = Block::default().borders(Borders::ALL).title(Span::styled(
-            " Hosts · first is default ",
-            Style::default().bold(),
-        ));
-        let list_area = block.inner(popup);
-        frame.render_widget(block, popup);
-
-        // The panel proper: one line per host, showing what you'd actually go
-        // here to find out — live connection state (with a `Failed` reason
-        // spelled out), how many sessions it holds and how many you're attached
-        // to, the daemon version it reported at handshake, and a latency sample.
-        // The header only carries the aggregate, so this is where the detail
-        // lives (§9).
-        let mut lines: Vec<Line> = Vec::new();
-        for (i, r) in state.rows.iter().enumerate() {
-            // Kept while the row editor is open, unlike the "+ add" line's: the
-            // card covers the middle of the list, and this is what says which
-            // row it belongs to once the label field is no longer the only clue.
-            let marker = if i == state.cursor { "\u{276F} " } else { "  " };
-            let label = if r.label.text().trim().is_empty() {
-                "(unnamed)".to_string()
-            } else {
-                r.label.text().to_string()
-            };
-            let host = r.host();
-            let icon = if r.icon.text().trim().is_empty() {
-                self.host_icon(&host)
-            } else {
-                r.icon.text().to_string()
-            };
-            // A suspended host is dimmed whole: it has no backend, so every live
-            // number the row would otherwise carry is simply absent, and the row
-            // should read as parked rather than as broken.
-            let label_style = if r.disabled {
-                Style::default().add_modifier(Modifier::DIM)
-            } else {
-                Style::default().fg(config::get().colors.ui.title_fg).bold()
-            };
-            let mut spans = vec![
-                Span::raw(marker),
-                Span::raw(format!("{icon} ")),
-                Span::styled(format!("{label:<14}"), label_style),
-            ];
-            // Everything before the status: marker (2) + icon and its space (3)
-            // + the padded label (14). A `Failed` reason quotes the host and can
-            // run for paragraphs, so it is truncated to what's left rather than
-            // being allowed to run off the popup — `l` is where it's read whole.
-            let status_width = (list_area.width as usize).saturating_sub(2 + 3 + 14);
-            if r.disabled {
-                // Not `host_status_spans`' "not connected", which means "there is
-                // no backend for this row *yet*" — this one is a decision.
-                spans.push(Span::styled(
-                    "disconnected",
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
-            } else {
-                spans.extend(self.host_status_spans(&host, status_width));
-            }
-            lines.push(Line::from(spans));
-            // The target is secondary detail — one indented dim line, so the
-            // status line above stays scannable across many hosts. The options
-            // ride that same line rather than earning one of their own: they
-            // *are* the rest of the ssh command the target ends, and a port
-            // forward among them is otherwise completely invisible — nothing
-            // else in the dashboard says a local port is answered by another
-            // machine.
-            //
-            // The clipboard marker lands here for exactly that reason: it *is*
-            // one more forward on the same child, so it belongs beside the ones
-            // the user typed rather than on the status line, which reports live
-            // connection state. The editor's `Clipboard` field is what sets it.
-            let mut detail = format!(
-                "      {} {} {}",
-                if r.is_socket { "socket" } else { "ssh" },
-                r.target.text(),
-                r.options.text().trim()
-            )
-            .trim_end()
-            .to_string();
-            if r.is_local {
-                detail = "      this machine".into();
-            }
-            // Appended after the trim, so a host with no options gets one space
-            // before the marker rather than two.
-            if !r.forwards.is_empty() {
-                detail.push_str(&format!("  {} port forwards", r.forwards.len()));
-            }
-            if r.clipboard {
-                detail.push_str(" \u{1f4cb}");
-            }
-            let codex = r
-                .codex
-                .as_ref()
-                .map(|c| c.mode.label())
-                .unwrap_or("unavailable");
-            detail.push_str(&format!("  Codex: {codex}"));
-            if let Some(error) = &r.codex_error {
-                detail.push_str(&format!(" ({error})"));
-            }
-            lines.push(Line::from(Span::styled(
-                detail,
-                Style::default().add_modifier(Modifier::DIM),
-            )));
+        frame.render_widget(
+            Block::default().borders(Borders::ALL).title(" Hosts "),
+            popup,
+        );
+        if popup.width < 10 || popup.height < 7 {
+            return;
         }
-        let add_on = state.cursor == state.rows.len() && state.edit.is_none();
-        lines.push(Line::from(Span::styled(
-            format!("{}+ add host", if add_on { "\u{276F} " } else { "  " }),
-            Style::default().add_modifier(Modifier::DIM),
-        )));
-        // Removing a host drops it and its mirror, so it asks first.
-        if let Some(idx) = state.pending_remove {
-            let label = state
-                .rows
-                .get(idx)
-                .map(|r| r.label.text().to_string())
-                .unwrap_or_default();
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                format!("  Remove host \"{label}\"? [y/N]"),
-                Style::default()
-                    .fg(config::get().colors.ui.attention_fg)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        let narrow = popup.width < 64;
+        // Offsets are terminal cells, including each column's reserved gap.
+        // Numeric columns share their right edge with the matching heading.
+        let (name, name_width, state_x, ends) = if narrow {
+            (4, 7, 13, [22, 28, 34, 40, 49])
+        } else {
+            (4, 10, 17, [32, 39, 46, 53, 66])
+        };
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
+        let dim = Style::default().dim();
+        let left = |frame: &mut ratatui::Frame, offset: u16, y, width, span: Span<'static>| {
+            let available = popup.width.saturating_sub(offset + 1).min(width);
+            frame.render_widget(
+                Paragraph::new(span),
+                Rect::new(popup.x + offset, y, available, 1),
+            );
+        };
+        let right = |frame: &mut ratatui::Frame, end: u16, y, width: u16, span: Span<'static>| {
+            let start = end.saturating_add(1).saturating_sub(width);
+            let available = popup.width.saturating_sub(start + 1).min(width);
+            frame.render_widget(
+                Paragraph::new(span).alignment(Alignment::Right),
+                Rect::new(popup.x + start, y, available, 1),
+            );
+        };
+        let header_y = popup.y + 2;
+        left(frame, name, header_y, name_width, Span::styled("HOST", dim));
+        left(
+            frame,
+            state_x,
+            header_y,
+            if narrow { 6 } else { 10 },
+            Span::styled("STATE", dim),
+        );
+        for ((end, width), label) in ends.into_iter().zip([4, 4, 4, 4, 7]).zip([
+            if narrow { "SES" } else { "SESS" },
+            "CPU",
+            "MEM",
+            "DISK",
+            "LATENCY",
+        ]) {
+            right(frame, end, header_y, width, Span::styled(label, dim));
         }
-        // The upgrade's question, or its refusal. Both render here rather than
-        // on a status line the panel doesn't have — a refusal the user never
-        // sees is indistinguishable from a key that does nothing.
-        if let Some(prompt) = &state.pending_upgrade {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                prompt.text.clone(),
-                Style::default()
-                    .fg(config::get().colors.ui.attention_fg)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        let visible = popup
+            .height
+            .saturating_sub(if state.message.is_some() { 8 } else { 6 })
+            as usize;
+        if visible == 0 {
+            return;
+        }
+        let scroll = state.cursor.saturating_sub(visible - 1);
+        for index in scroll..(scroll + visible).min(state.rows.len() + 1) {
+            let y = popup.y + 4 + (index - scroll) as u16;
+            let selected = index == state.cursor;
+            if selected {
+                frame.buffer_mut().set_style(
+                    Rect::new(popup.x + 1, y, popup.width - 2, 1),
+                    Style::default().bg(ui.highlight_bg),
+                );
+                left(
+                    frame,
+                    2,
+                    y,
+                    2,
+                    Span::styled(
+                        ui.selection_symbol.clone(),
+                        Style::default().fg(ui.selection_fg),
+                    ),
+                );
+            }
+            let Some(row) = state.rows.get(index) else {
+                left(
+                    frame,
+                    name,
+                    y,
+                    popup.width.saturating_sub(name + 1),
+                    Span::styled("+ add host", dim),
+                );
+                continue;
+            };
+            let label = if row.is_local {
+                "local"
+            } else if row.label.text().trim().is_empty() {
+                "(unnamed)"
+            } else {
+                row.label.text()
+            };
+            let style = if row.disabled {
+                dim
+            } else {
+                Style::default().fg(ui.title_fg)
+            };
+            left(
+                frame,
+                name,
+                y,
+                name_width,
+                Span::styled(one_line(label, name_width as usize), style),
+            );
+            let [connection, sessions, cpu, mem, disk, latency] =
+                self.host_list_values(row, narrow);
+            left(frame, state_x, y, if narrow { 6 } else { 10 }, connection);
+            for ((end, width), value) in ends
+                .into_iter()
+                .zip([4, 4, 4, 4, 7])
+                .zip([sessions, cpu, mem, disk, latency])
+            {
+                right(frame, end, y, width, value);
+            }
         }
         if let Some(message) = &state.message {
-            lines.push(Line::from(message.clone()));
+            left(
+                frame,
+                3,
+                popup.y + popup.height - 3,
+                popup.width.saturating_sub(6),
+                Span::styled(
+                    one_line(message, popup.width.saturating_sub(6) as usize),
+                    Style::default().fg(ui.attention_fg),
+                ),
+            );
         }
-        let selected_line = if state.pending_remove.is_some()
-            || state.pending_upgrade.is_some()
-            || state.message.is_some()
-        {
-            lines.len().saturating_sub(1)
-        } else {
-            (state.cursor * 2 + 1).min(lines.len().saturating_sub(1))
+    }
+
+    fn draw_host_details(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(state) = self.host_edit.as_ref() else {
+            return;
         };
-        let scroll = selected_line.saturating_sub(list_area.height.saturating_sub(1) as usize);
-        frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), list_area);
+        let Some(row) = state.rows.get(state.cursor) else {
+            return;
+        };
+        let mut popup = Self::hosts_popup(area);
+        popup.height = area.height.saturating_sub(2).min(24);
+        popup.y = area.y + (area.height - popup.height) / 2;
+        clear_overlay(frame, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(2))
+            .title(format!(
+                " {} · details ",
+                one_line(row.label.text(), popup.width.saturating_sub(16) as usize)
+            ));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let width = inner.width as usize;
+        let cfg = config::get();
+        let ui = &cfg.colors.ui;
+        let dim = Style::default().dim();
+        let backend = self.backend_for(&row.host()).filter(|_| !row.disabled);
+        let connection = backend.map(|b| b.conn_state());
+        let mut lines = Vec::new();
+        let append = |lines: &mut Vec<Line>, text: String, style| {
+            let text = crate::backend::host_text_safe(&text);
+            for physical_line in text.split('\n') {
+                for range in wrap_ranges(physical_line, width) {
+                    lines.push(Line::from(Span::styled(
+                        physical_line[range].to_owned(),
+                        style,
+                    )));
+                }
+            }
+        };
+        let (label, style) = match &connection {
+            _ if row.disabled => ("Suspended by you", dim),
+            Some(ConnState::Connected) => ("Connected", Style::default().fg(Color::Green)),
+            Some(ConnState::Connecting) => ("Connecting", dim),
+            Some(ConnState::Failed(_)) => ("Connection failed", Style::default().fg(ui.error_fg)),
+            _ => ("Not connected", dim),
+        };
+        append(&mut lines, label.into(), style);
+        if let Some(state @ ConnState::Failed(_)) = &connection {
+            append(
+                &mut lines,
+                state.label().to_owned(),
+                Style::default().fg(ui.error_fg),
+            );
+        }
+        if connection.as_ref().is_some_and(ConnState::is_connected) {
+            let (running, attached) = self.host_session_counts(&row.host());
+            append(
+                &mut lines,
+                format!(
+                    "{running} {} / {attached} attached",
+                    super::plural_sessions(running)
+                ),
+                Style::default(),
+            );
+        }
+        append(&mut lines, String::new(), dim);
+        append(&mut lines, "Connection".into(), dim);
+        append(
+            &mut lines,
+            if row.is_local {
+                "this machine".into()
+            } else {
+                format!(
+                    "{} {}",
+                    if row.is_socket { "socket" } else { "ssh" },
+                    row.target.text()
+                )
+            },
+            Style::default(),
+        );
+        if !row.options.text().trim().is_empty() {
+            append(&mut lines, row.options.text().to_owned(), dim);
+        }
+        if let Some(backend) = backend {
+            if let Some(version) = backend.daemon_version() {
+                let mut server = format!("Server v{version}");
+                match backend.upgrade_offer() {
+                    Some(offer) => server.push_str(&format!(" → v{} (u upgrade)", offer.version)),
+                    None if super::format::version_is_older(
+                        &version,
+                        env!("CARGO_PKG_VERSION"),
+                    ) =>
+                    {
+                        server.push_str(" (older than ours)")
+                    }
+                    None => {}
+                }
+                append(&mut lines, server, dim);
+            }
+            append(&mut lines, String::new(), dim);
+            append(&mut lines, "Resources".into(), dim);
+            let values = self.host_list_values(row, false);
+            lines.push(Line::from(vec![
+                Span::styled("CPU ", dim),
+                values[2].clone(),
+                Span::styled("   Mem ", dim),
+                values[3].clone(),
+                Span::styled("   Disk ", dim),
+                values[4].clone(),
+            ]));
+            append(&mut lines, format!("Latency {}", values[5].content), dim);
+        }
+        append(&mut lines, String::new(), dim);
+        append(&mut lines, "Codex".into(), dim);
+        append(
+            &mut lines,
+            row.codex
+                .as_ref()
+                .map(|c| c.mode.label().to_owned())
+                .unwrap_or_else(|| "Unavailable".into()),
+            Style::default(),
+        );
+        if HostField::CodexEndpoint.visible_for(row) {
+            append(&mut lines, row.codex_endpoint.text().to_owned(), dim);
+        }
+        if let Some(error) = &row.codex_error {
+            append(
+                &mut lines,
+                error.clone(),
+                Style::default().fg(ui.attention_fg),
+            );
+        }
+        if !row.is_local {
+            append(&mut lines, String::new(), dim);
+            append(&mut lines, "Services".into(), dim);
+            append(
+                &mut lines,
+                format!(
+                    "Clipboard {} / {} enabled port forwards",
+                    if row.clipboard { "on" } else { "off" },
+                    row.forwards.iter().filter(|f| !f.disabled).count()
+                ),
+                Style::default(),
+            );
+            if !row.shell_command.text().trim().is_empty() {
+                append(&mut lines, row.shell_command.text().to_owned(), dim);
+            }
+        }
+        if let Some(message) = &state.message {
+            append(&mut lines, String::new(), dim);
+            append(
+                &mut lines,
+                message.clone(),
+                Style::default().fg(ui.attention_fg),
+            );
+        }
+        let rows = inner.height as usize;
+        let scroll = if state.message.is_some() {
+            lines.len().saturating_sub(rows)
+        } else {
+            state.detail_scroll.min(lines.len().saturating_sub(rows))
+        };
+        frame.render_widget(
+            Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
+        if let Some(state) = self.host_edit.as_mut() {
+            state.detail_rows = rows;
+            state.detail_scroll = scroll;
+        }
+    }
+
+    fn draw_host_help(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(state) = self.host_edit.as_ref() else {
+            return;
+        };
+        let popup = Self::hosts_popup(area);
+        clear_overlay(frame, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(2))
+            .title(" Host commands ");
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let mut commands = vec![
+            ("j/k", "Select a host; scroll details"),
+            ("Enter", "Open details / add host"),
+            ("e / a", "Edit / add host"),
+            ("J / K", "Move down / up; first host is default"),
+        ];
+        if self.selected_host_has_log() {
+            commands.push(("l", "Connection log"));
+        }
+        if self.selected_host_has_forwards() {
+            commands.push(("f", "Port forwards"));
+        }
+        if state.rows.get(state.cursor).is_some_and(|r| !r.is_local) {
+            commands.extend([
+                ("c", "Suspend / reconnect"),
+                ("d", "Remove host (asks first)"),
+                ("Ctrl+t/e", "Edit target / pick icon"),
+            ]);
+        }
+        if self.selected_host_upgrade().is_some() {
+            commands.push(("u", "Upgrade server (asks first)"));
+        }
+        commands.push(("Esc", "Back / cancel"));
+        let lines: Vec<_> = commands
+            .into_iter()
+            .map(|(key, text)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{key:<10}"),
+                        Style::default().fg(config::get().colors.ui.title_fg),
+                    ),
+                    Span::raw(one_line(text, inner.width.saturating_sub(10) as usize)),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_host_prompt(&self, frame: &mut ratatui::Frame, area: Rect) {
+        let Some(state) = self.host_edit.as_ref() else {
+            return;
+        };
+        let (title, text) = if let Some(index) = state.pending_remove {
+            let label = state.rows.get(index).map(|r| r.label.text()).unwrap_or("");
+            (
+                " Remove host? ",
+                format!("Remove host \"{label}\" and its dashboard mirror? [y/N]"),
+            )
+        } else if let Some(prompt) = &state.pending_upgrade {
+            (" Upgrade server ", prompt.text.clone())
+        } else {
+            return;
+        };
+        let host_popup = Self::hosts_popup(area);
+        let width = host_popup.width.saturating_sub(4);
+        let lines: Vec<_> = wrap_ranges(&text, width.saturating_sub(6) as usize)
+            .into_iter()
+            .map(|r| Line::from(text[r].to_owned()))
+            .collect();
+        let height = (lines.len() as u16 + 4).min(area.height);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame
+            .buffer_mut()
+            .set_style(host_popup, Style::default().dim());
+        clear_overlay(frame, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(2))
+            .title(title);
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().fg(config::get().colors.ui.attention_fg)),
+            inner,
+        );
     }
 
     /// The selected row's fields, as a card floating over the list.
@@ -735,33 +983,17 @@ impl App {
         if let Some(focus) = state.focus()
             && let Some(r) = state.rows.get(state.cursor)
         {
-            let host_popup = centered_rect(Self::HOSTS_POPUP.0, Self::HOSTS_POPUP.1, area);
-            // Sized to the *widest* hint over every field, not to the focused
-            // field's: the hints differ by tens of cells, so a card measured
-            // from the current one would resize under the cursor as Tab walks
-            // the form. Plus six — two borders, their padding, and a cell of
-            // margin so the longest hint doesn't sit against the frame.
-            let hint_w = {
-                use unicode_width::UnicodeWidthStr;
-                HostField::ORDER
-                    .iter()
-                    .filter_map(|f| host_field_hint(*f))
-                    .map(|h| h.width() as u16)
-                    .max()
-                    .unwrap_or(0)
-            };
-            // Never wider than the popup behind it less two cells a side, so it
-            // stays inside that frame and reads as floating over the list: a card
-            // exactly as wide lands its own border on the same columns, and the
-            // two then look like one panel with a divider drawn across it.
-            let width = (hint_w + 6).min(host_popup.width.saturating_sub(4));
+            let host_popup = Self::hosts_popup(area);
+            // Keep every tab the same width, inset two cells per side from
+            // the parent panel. Long values wrap within that fixed cell grid.
+            let width = host_popup.width.saturating_sub(4);
             // What a field's text has to fit in: the card's inner width — the
             // frame and its padding are two cells a side — less the fixed
             // columns ahead of the value, less one cell for the end-of-text
             // cursor, which needs somewhere to sit on an otherwise full line.
             let label_w = HostField::ORDER
                 .iter()
-                .filter(|field| field.visible_for(r))
+                .filter(|field| field.visible_for(r) && field.section() == focus.section())
                 .map(|field| field.label().len())
                 .max()
                 .unwrap_or(0)
@@ -799,96 +1031,97 @@ impl App {
                     })
                     .collect::<Vec<_>>()
             };
-            let label_lines = text_field_lines(&r.label, focus == HostField::Label, value_w);
-            let kind = if r.is_socket { "socket" } else { "ssh" };
-            let prefix = format!("[{kind}] ");
-            // The kind sits ahead of the target on its first line, so that line
-            // has that much less room — and every line of the field is wrapped to
-            // it, rather than the continuation lines silently running wider than
-            // the one above them.
-            let mut target_lines = text_field_lines(
-                &r.target,
-                focus == HostField::Target,
-                value_w.saturating_sub(prefix.chars().count()),
+            let tabs = Line::from(
+                HostSection::ALL
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, section)| {
+                        let visible = HostField::ORDER
+                            .iter()
+                            .any(|f| f.section() == section && f.visible_for(r))
+                            || (r.is_local && section == HostSection::Codex);
+                        visible.then(|| {
+                            let active = section == focus.section();
+                            Span::styled(
+                                if active {
+                                    format!("[{} {}]  ", i + 1, section.label())
+                                } else {
+                                    format!(" {} {}   ", i + 1, section.label())
+                                },
+                                if active {
+                                    Style::default().fg(config::get().colors.ui.title_fg)
+                                } else {
+                                    Style::default().dim()
+                                },
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             );
-            target_lines[0].insert(
-                0,
-                Span::styled(prefix, Style::default().add_modifier(Modifier::DIM)),
-            );
-            let options_lines = text_field_lines(&r.options, focus == HostField::Options, value_w);
-            // The derived emoji stands where the field's text would be, dim, so
-            // an empty field says what it will *do* rather than reading as one
-            // the user forgot. It follows the cursor rather than replacing it.
-            let mut icon_lines = text_field_lines(&r.icon, focus == HostField::Icon, value_w);
-            if r.icon.text().trim().is_empty()
-                && let Some(last) = icon_lines.last_mut()
+            let mut form_lines = Vec::new();
+            for field in HostField::ORDER
+                .into_iter()
+                .filter(|field| field.section() == focus.section() && field.visible_for(r))
             {
-                last.push(Span::styled(
-                    format!("{} (auto)", self.host_icon(&r.host())),
-                    Style::default().add_modifier(Modifier::DIM),
-                ));
+                let focused = focus == field;
+                let values = match field {
+                    HostField::Label => text_field_lines(&r.label, focused, value_w),
+                    HostField::Target => {
+                        let prefix = format!("[{}] ", if r.is_socket { "socket" } else { "ssh" });
+                        let mut lines = text_field_lines(
+                            &r.target,
+                            focused,
+                            value_w.saturating_sub(prefix.len()),
+                        );
+                        lines[0].insert(0, Span::styled(prefix, Style::default().dim()));
+                        lines
+                    }
+                    HostField::Options => text_field_lines(&r.options, focused, value_w),
+                    HostField::Icon => {
+                        let mut lines = text_field_lines(&r.icon, focused, value_w);
+                        if r.icon.text().trim().is_empty()
+                            && let Some(last) = lines.last_mut()
+                        {
+                            last.push(Span::styled(
+                                format!("{} (auto)", self.host_icon(&r.host())),
+                                Style::default().dim(),
+                            ));
+                        }
+                        lines
+                    }
+                    HostField::Clipboard => {
+                        vec![vec![Span::raw(if r.clipboard { "[on]" } else { "[off]" })]]
+                    }
+                    HostField::CodexMode => vec![vec![Span::raw(format!(
+                        "[{}]",
+                        r.codex.as_ref().unwrap().mode.label()
+                    ))]],
+                    HostField::CodexEndpoint => {
+                        text_field_lines(&r.codex_endpoint, focused, value_w)
+                    }
+                    HostField::Forwards => vec![vec![Span::raw(format!(
+                        "{} enabled · {} total  [manage]",
+                        r.forwards.iter().filter(|f| !f.disabled).count(),
+                        r.forwards.len()
+                    ))]],
+                    HostField::ShellCommand => {
+                        let mut lines = text_field_lines(&r.shell_command, focused, value_w);
+                        if r.shell_command.text().trim().is_empty()
+                            && let Some(last) = lines.last_mut()
+                        {
+                            last.push(Span::styled("(default shell)", Style::default().dim()));
+                        }
+                        lines
+                    }
+                };
+                form_lines.extend(field_rows(field, values));
             }
-            // The one field with no cursor, so it has to say its state in words:
-            // `[off]` on an untouched row is what tells you the setting is here at
-            // all. The marker doubles as the tie to the row's own `📋`.
-            let clipboard_line = vec![
-                Span::styled(
-                    if r.clipboard { "[on] " } else { "[off]" },
-                    Style::default().add_modifier(Modifier::DIM),
-                ),
-                Span::raw(if r.clipboard { "\u{1f4cb}" } else { "" }),
-            ];
-            let mut form_lines = field_rows(HostField::Label, label_lines);
-            form_lines.extend(field_rows(HostField::Target, target_lines));
-            if HostField::Options.visible_for(r) {
-                form_lines.extend(field_rows(HostField::Options, options_lines));
-            }
-            form_lines.extend(field_rows(HostField::Icon, icon_lines));
-            form_lines.extend(field_rows(HostField::Clipboard, vec![clipboard_line]));
-            if r.is_local {
-                form_lines.clear();
-            }
-            if let Some(codex) = &r.codex {
-                form_lines.extend(field_rows(
-                    HostField::CodexMode,
-                    vec![vec![Span::raw(format!("[{}]", codex.mode.label()))]],
-                ));
-                if HostField::CodexEndpoint.visible_for(r) {
-                    form_lines.extend(field_rows(
-                        HostField::CodexEndpoint,
-                        text_field_lines(
-                            &r.codex_endpoint,
-                            focus == HostField::CodexEndpoint,
-                            value_w,
-                        ),
-                    ));
-                }
-            } else if r.is_local {
+            if r.is_local && r.codex.is_none() {
                 form_lines.push(Line::from(
                     r.codex_error
                         .clone()
                         .unwrap_or_else(|| "Loading Codex settings…".into()),
                 ));
-            }
-            if HostField::Forwards.visible_for(r) {
-                form_lines.extend(field_rows(
-                    HostField::Forwards,
-                    vec![vec![Span::raw(format!(
-                        "{} enabled · {} total  [manage]",
-                        r.forwards.iter().filter(|f| !f.disabled).count(),
-                        r.forwards.len()
-                    ))]],
-                ));
-            }
-            if HostField::ShellCommand.visible_for(r) {
-                let mut command_lines =
-                    text_field_lines(&r.shell_command, focus == HostField::ShellCommand, value_w);
-                if r.shell_command.text().trim().is_empty()
-                    && let Some(last) = command_lines.last_mut()
-                {
-                    last.push(Span::styled("(default shell)", Style::default().dim()));
-                }
-                form_lines.extend(field_rows(HostField::ShellCommand, command_lines));
             }
             // The field rows — one per field until a value wraps — a blank, the
             // hint line (held whether this field has a hint or not, for the same
@@ -896,11 +1129,11 @@ impl App {
             // value wraps rather than the value being cut off at the frame: this
             // is text being *edited*, and what you cannot see you cannot tell you
             // typed twice.
-            let height = (form_lines.len() as u16 + 4).min(host_popup.height);
+            let height = (form_lines.len() as u16 + 6).min(host_popup.height);
             // A terminal too small to draw a frame around anything. The dashboard
             // as a whole is unusable well before this, so it is a guard against a
             // degenerate `Rect`, not a layout for a narrow screen.
-            if width < 8 || height < 3 {
+            if width < 8 || height < 5 {
                 return;
             }
             let popup = Rect {
@@ -920,8 +1153,11 @@ impl App {
             // Which of the two things Esc will do: put a row back, or drop one
             // that was never on disk. The old inline form couldn't say.
             let title = match state.edit.as_ref().map(|e| &e.origin) {
-                Some(EditOrigin::Added) => " Add Host ",
-                _ => " Edit Host ",
+                Some(EditOrigin::Added) => " Add Host ".to_owned(),
+                _ => format!(
+                    " Edit Host · {} ",
+                    one_line(r.label.text(), width.saturating_sub(18) as usize)
+                ),
             };
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -930,6 +1166,16 @@ impl App {
                 .title(Span::styled(title, Style::default().bold()));
             let inner = block.inner(popup);
             frame.render_widget(block, popup);
+            frame.render_widget(
+                Paragraph::new(tabs),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+            let fields_area = Rect::new(
+                inner.x,
+                inner.y + 2,
+                inner.width,
+                inner.height.saturating_sub(2),
+            );
 
             // The blank goes in whether or not this field has a hint, so the one
             // line the card reserves for it doesn't shunt the fields up and down.
@@ -955,10 +1201,10 @@ impl App {
                     })
                 })
                 .unwrap_or(0);
-            let scroll = focus_line.saturating_sub(inner.height.saturating_sub(2) as usize);
+            let scroll = focus_line.saturating_sub(fields_area.height.saturating_sub(2) as usize);
             frame.render_widget(
                 Paragraph::new(form_lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
-                inner,
+                fields_area,
             );
         }
     }
@@ -969,6 +1215,80 @@ impl App {
 // =============================================================================
 
 impl App {
+    pub(super) fn host_hints(&self, width: u16) -> Vec<Span<'static>> {
+        let Some(state) = &self.host_edit else {
+            return Vec::new();
+        };
+        let pairs: Vec<(&str, &str)> = if state.forward_view.is_some() {
+            return vec![Span::raw(self.forward_hints())];
+        } else if state.log_view.is_some() {
+            vec![("j/k", "scroll"), ("g/G", "top/bottom"), ("Esc", "back")]
+        } else if state.pending_remove.is_some() {
+            vec![("y", "remove"), ("Esc", "cancel")]
+        } else if let Some(prompt) = &state.pending_upgrade {
+            if prompt.actionable {
+                vec![("y", "upgrade"), ("Esc", "cancel")]
+            } else {
+                vec![("Any key", "back")]
+            }
+        } else if matches!(state.view, HostView::Help { .. }) {
+            vec![("Esc", "back")]
+        } else if let Some(focus) = state.focus() {
+            let mut pairs = vec![(if width < 80 { "Tab" } else { "Tab/↑↓" }, "field")];
+            if !state.rows[state.cursor].is_local {
+                pairs.push((
+                    if state.rows[state.cursor].codex.is_some() {
+                        "Alt+1/2/3"
+                    } else {
+                        "Alt+1/3"
+                    },
+                    "tab",
+                ));
+            }
+            pairs.extend([
+                (
+                    "Enter",
+                    if focus == HostField::Forwards {
+                        "manage"
+                    } else {
+                        "apply"
+                    },
+                ),
+                ("Esc", "cancel"),
+            ]);
+            pairs
+        } else if state.view == HostView::Details {
+            let mut pairs = vec![("e", "edit")];
+            if self.selected_host_has_log() {
+                pairs.push(("l", "log"));
+            }
+            if self.selected_host_has_forwards() {
+                pairs.push(("f", "forwards"));
+            }
+            pairs.extend([("?", "keys"), ("Esc", "back")]);
+            pairs
+        } else if width < 80 {
+            vec![
+                ("Enter", "open"),
+                ("J/K", "move"),
+                ("e", "edit"),
+                ("?", "keys"),
+                ("Esc", "close"),
+            ]
+        } else {
+            let mut pairs = vec![("j/k", "select"), ("Enter", "details")];
+            if state.cursor < state.rows.len() && state.rows.len() > 1 {
+                pairs.push(("J/K", "reorder"));
+            }
+            pairs.extend([("e", "edit"), ("?", "keys"), ("Esc", "close")]);
+            pairs
+        };
+        pairs
+            .into_iter()
+            .flat_map(|(key, label)| hint_pair(key, label))
+            .collect()
+    }
+
     pub(super) fn selected_host_has_log(&self) -> bool {
         self.host_edit
             .as_ref()
@@ -990,6 +1310,16 @@ impl App {
         let has_log = self.selected_host_has_log();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let HostView::Help { from_details } = self.host_edit.as_ref()?.view {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
+                self.host_edit.as_mut()?.view = if from_details {
+                    HostView::Details
+                } else {
+                    HostView::List
+                };
+            }
+            return None;
+        }
         if self.host_edit.as_ref()?.forward_view.is_some() {
             self.handle_port_forward_key(key);
             return None;
@@ -1001,7 +1331,9 @@ impl App {
             && self.host_edit.as_ref()?.log_view.is_none()
             && self.host_edit.as_ref()?.pending_remove.is_none()
             && self.host_edit.as_ref()?.pending_upgrade.is_none())
-            || (matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+            || (!ctrl
+                && !alt
+                && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
                 && self.host_edit.as_ref()?.focus() == Some(HostField::Forwards))
         {
             self.open_port_forwards();
@@ -1036,6 +1368,7 @@ impl App {
                     state.cursor = state.cursor.min(state.rows.len());
                 }
                 self.apply_host_edits();
+                self.host_edit.as_mut()?.view = HostView::List;
             }
             return None;
         }
@@ -1046,7 +1379,20 @@ impl App {
 
         // List-mode globals (in field-edit these are text / Esc-back).
         if !editing && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.close_host_edit();
+            if self.host_edit.as_ref()?.view == HostView::Details {
+                let state = self.host_edit.as_mut()?;
+                state.view = HostView::List;
+                state.detail_scroll = 0;
+            } else {
+                self.close_host_edit();
+            }
+            return None;
+        }
+        if !editing && !ctrl && !alt && key.code == KeyCode::Char('?') {
+            let state = self.host_edit.as_mut()?;
+            state.view = HostView::Help {
+                from_details: state.view == HostView::Details,
+            };
             return None;
         }
 
@@ -1085,6 +1431,18 @@ impl App {
 
         let state = self.host_edit.as_mut()?;
         if let Some(focus) = state.focus() {
+            if alt
+                && !ctrl
+                && let KeyCode::Char(digit @ '1'..='3') = key.code
+            {
+                let section = HostSection::ALL[(digit as u8 - b'1') as usize];
+                if let Some(field) = HostField::ORDER.into_iter().find(|field| {
+                    field.section() == section && field.visible_for(&state.rows[state.cursor])
+                }) {
+                    state.edit.as_mut()?.focus = field;
+                }
+                return None;
+            }
             // Field focus, by all three idioms the dashboard already uses: Tab
             // walks the form, ↑↓ walk it as the vertical list it looks like, and
             // ^n/^p are what the pickers bind. Backwards matters as much as
@@ -1113,7 +1471,7 @@ impl App {
             }
             match key.code {
                 // Committing a row applies it: persist + reconnect right away.
-                KeyCode::Enter => {
+                KeyCode::Enter if !ctrl && !alt => {
                     let row = state.rows.get(state.cursor)?;
                     if let Err(error) = shell_words::split(row.options.text()) {
                         state.message = Some(format!("Invalid SSH options: {error}"));
@@ -1150,7 +1508,7 @@ impl App {
                     return None;
                 }
                 KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                    if focus == HostField::CodexMode =>
+                    if focus == HostField::CodexMode && !ctrl && !alt =>
                 {
                     if let Some(config) = state
                         .rows
@@ -1172,7 +1530,7 @@ impl App {
                 // else in this form, and a key that means "save" on four fields
                 // must not mean "change" on the fifth.
                 KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                    if focus == HostField::Clipboard =>
+                    if focus == HostField::Clipboard && !ctrl && !alt =>
                 {
                     if let Some(r) = state.rows.get_mut(state.cursor) {
                         r.clipboard = !r.clipboard;
@@ -1180,6 +1538,16 @@ impl App {
                     return None;
                 }
                 _ => {}
+            }
+            if ctrl || alt {
+                // TextInput handles readline keys, but modified keys never
+                // toggle a setting or commit a draft.
+                if matches!(
+                    focus,
+                    HostField::Clipboard | HostField::CodexMode | HostField::Forwards
+                ) {
+                    return None;
+                }
             }
             // Everything else is text. The fields are `TextInput`s, so the
             // readline keys, the arrows and Home/End all come for free — and a
@@ -1230,6 +1598,12 @@ impl App {
             if ctrl || alt {
                 if ctrl {
                     match key.code {
+                        KeyCode::Char('n') if state.view == HostView::Details => {
+                            state.detail_scroll += 1
+                        }
+                        KeyCode::Char('p') if state.view == HostView::Details => {
+                            state.detail_scroll = state.detail_scroll.saturating_sub(1)
+                        }
                         KeyCode::Char('n') => state.cursor = (state.cursor + 1).min(n),
                         KeyCode::Char('p') => state.cursor = state.cursor.saturating_sub(1),
                         KeyCode::Char('t') if state.cursor < n => {
@@ -1240,10 +1614,30 @@ impl App {
                 }
                 return None;
             }
+            if state.view == HostView::Details {
+                let page = state.detail_rows.saturating_sub(1).max(1);
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.detail_scroll = state.detail_scroll.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => state.detail_scroll += 1,
+                    KeyCode::PageDown => state.detail_scroll += page,
+                    KeyCode::PageUp => {
+                        state.detail_scroll = state.detail_scroll.saturating_sub(page)
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => state.detail_scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => state.detail_scroll = usize::MAX,
+                    _ => {}
+                }
+            }
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => state.cursor = state.cursor.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => state.cursor = (state.cursor + 1).min(n),
-                KeyCode::Char('J' | 'K') if state.cursor < n => {
+                KeyCode::Up | KeyCode::Char('k') if state.view == HostView::List => {
+                    state.cursor = state.cursor.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') if state.view == HostView::List => {
+                    state.cursor = (state.cursor + 1).min(n)
+                }
+                KeyCode::Char('J' | 'K') if state.view == HostView::List && state.cursor < n => {
                     let next = if key.code == KeyCode::Char('J') {
                         state.cursor + 1
                     } else {
@@ -1258,7 +1652,14 @@ impl App {
                         self.save_overrides();
                     }
                 }
-                KeyCode::Char('a') => state.begin_new_row(),
+                KeyCode::Char('a') => {
+                    state.view = HostView::List;
+                    state.begin_new_row();
+                }
+                KeyCode::Enter if state.cursor < n => {
+                    state.view = HostView::Details;
+                    state.detail_scroll = 0;
+                }
                 KeyCode::Char('e') | KeyCode::Enter => {
                     if state.cursor == n {
                         state.begin_new_row();
@@ -1269,9 +1670,8 @@ impl App {
                 // Suspend / resume the host. No confirm: unlike `d` it destroys
                 // nothing — the row, its target and its icon all stay — and the
                 // same key puts it straight back. No status line either: this
-                // mode's footer renders key hints, so a message would only
-                // surface, stale, once the panel closed — and the row itself
-                // answers immediately (dimmed, reading `disconnected`, or
+                // mode's footer renders key hints — and the row itself
+                // answers immediately (dimmed, reading `suspended`, or
                 // animating back through `connecting`).
                 KeyCode::Char('c') if state.cursor < n && !state.rows[state.cursor].is_local => {
                     let row = &mut state.rows[state.cursor];
@@ -1285,10 +1685,8 @@ impl App {
                 KeyCode::Char('d') if state.cursor < n && !state.rows[state.cursor].is_local => {
                     state.pending_remove = Some(state.cursor);
                 }
-                // Upgrade the host's server. Offered only where it would land on
-                // something else — the row's `↑` says so, and the footer hint
-                // appears with it — so a press here always has a decision to
-                // report, either the cost or the reason there isn't one.
+                // Details and help expose upgrades only when the backend has
+                // an offer. The prompt reports its cost or why it is blocked.
                 KeyCode::Char('u') if state.cursor < n => {
                     let row = state.cursor;
                     let host = state.rows[row].host();
@@ -1321,8 +1719,7 @@ impl App {
                     };
                     self.host_edit.as_mut()?.pending_upgrade = Some(prompt);
                 }
-                // The row shows one truncated line of a failure; `l` is where
-                // the whole thing — and the steps before it — is readable.
+                // Details explain the failure; the log adds the steps before it.
                 KeyCode::Char('l') if state.cursor < n && has_log => {
                     let host = state.rows[state.cursor].host();
                     state.log_view = Some(HostLogView {
@@ -1377,38 +1774,22 @@ impl App {
 // Rendering helpers -- host-only, so they live with the panel they serve
 // =============================================================================
 
-/// The hosts row-editor hint for one field, or `None` for a field that speaks for
-/// itself. Indented to the label column, so it reads as belonging to the form
-/// rather than to the card's frame.
-///
-/// A function over the field rather than a `match` inside the draw, because the
-/// card is sized to the widest of these and that needs them enumerable — a hint
-/// that only exists inside the arm that renders it can't be measured before it is
-/// the focused one, which is how a form ends up resizing under the cursor.
+/// Contextual help for the focused field. The form reserves a hint row even
+/// when a field needs no explanation, keeping its fields in the same cells.
 fn host_field_hint(field: HostField) -> Option<&'static str> {
     match field {
         // The label is a name. Nothing to explain.
         HostField::Label => None,
-        HostField::CodexMode => {
-            Some("  Space toggle   applies to new launches and explicit restarts")
-        }
-        HostField::CodexEndpoint => {
-            Some("  Unix socket on this host; unix:// uses the Codex default")
-        }
+        HostField::CodexMode => Some("  Space toggle · affects launches and restarts"),
+        HostField::CodexEndpoint => Some("  Unix socket; unix:// uses the default"),
         HostField::Target => Some("  ^t toggle ssh / socket"),
         // Point port setup toward the dedicated manager beside this field.
-        HostField::Options => Some("  Quoted SSH arguments; use Port forwards below for tunnels"),
-        HostField::ShellCommand => Some("  Runs in new remote work tabs; empty = default shell"),
-        HostField::Forwards => {
-            Some("  Enter manage ports or import -L/-R/-D; save host edits first")
-        }
+        HostField::Options => Some("  Quoted SSH arguments; tunnels in Services"),
+        HostField::ShellCommand => Some("  Runs in work tabs; empty = default shell"),
+        HostField::Forwards => Some("  Enter manage; apply host edits first"),
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
-        // Names the key, then the direction — "clipboard" on a host row could as
-        // easily mean the host's own, and *whose* it is is the whole point. It is
-        // the longest of these, so it is what the card's width is set by.
-        HostField::Clipboard => {
-            Some("  Space toggle   offer this machine's clipboard — paste a screenshot there")
-        }
+        // Name whose clipboard is offered, as well as the toggle key.
+        HostField::Clipboard => Some("  Space toggle · offer the local clipboard"),
     }
 }
 

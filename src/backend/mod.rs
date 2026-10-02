@@ -277,9 +277,9 @@ impl ConnState {
     ///
     /// "Short" is the caller's job to enforce: a `Failed` reason quotes what the
     /// host said, which is routinely a paragraph — a NixOS box refusing a
-    /// glibc-linked binary answers in four lines. The panel flattens and
-    /// truncates it to its row, and the full text lives in the connection log
-    /// (`l`), which exists precisely because one row cannot hold it.
+    /// glibc-linked binary answers in four lines. The list shows a compact
+    /// state; details and the connection log
+    /// (`l`) preserve the full reason.
     pub(crate) fn label(&self) -> &str {
         match self {
             ConnState::Connecting => "connecting",
@@ -1639,6 +1639,17 @@ impl RemoteBackend {
     pub(crate) fn simulate_link_for_tests(&self, conn: ConnState, mirrored: bool) {
         *self.conn.lock().unwrap() = conn;
         self.mirrored.store(mirrored, Ordering::Relaxed);
+    }
+
+    /// Land the readings a host-panel render would receive from a poll.
+    #[cfg(test)]
+    pub(crate) fn simulate_vitals_for_tests(
+        &self,
+        vitals: Option<HostVitals>,
+        latency: Option<Duration>,
+    ) {
+        self.vitals.settle(vitals);
+        *self.latency.lock().unwrap() = latency;
     }
 
     /// Everything a [`RemoteBackend`] and its connection task share, built but
