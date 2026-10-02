@@ -6071,6 +6071,7 @@ fn host_panel_with_readings(width: u16, height: u16) -> TestDashboard {
                 label: name.into(),
                 ssh: Some("test-target".into()),
                 disabled: name == "archive",
+                icon: (name == "build").then(|| "🚀".into()),
                 ..Default::default()
             })
             .collect(),
@@ -6121,8 +6122,7 @@ fn host_panel_with_readings(width: u16, height: u16) -> TestDashboard {
 
 #[test]
 fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
-    use unicode_width::UnicodeWidthStr;
-    for (width, height) in [(100, 28), (80, 24), (60, 22)] {
+    for (width, height) in [(120, 40), (100, 28), (80, 24), (60, 22)] {
         let mut d = host_panel_with_readings(width, height);
         let out = d.render();
         let header = out
@@ -6152,6 +6152,16 @@ fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
             .find(|line| line.contains("build") && line.contains("34%"))
             .unwrap_or_else(|| panic!("{out}"));
         assert!(build.contains("5"), "{out}");
+        let buf = d.terminal.backend().buffer();
+        let (name_x, build_y) = find_cell(buf, "build").unwrap();
+        assert_eq!(buf[(name_x - 3, build_y)].symbol(), "🚀");
+        let (local_x, local_y) = find_cell(buf, "local").unwrap();
+        assert_eq!(buf[(local_x - 3, local_y)].symbol(), "🏠");
+        let (archive_x, archive_y) = find_cell(buf, "archive").unwrap();
+        assert_eq!(
+            buf[(archive_x - 3, archive_y)].symbol(),
+            d.app.host_icon(&crate::state::HostId("archive".into()))
+        );
         // The heading and numeric values end in the same terminal cell.
         for (heading, value) in [
             ("SES", "5"),
@@ -6165,10 +6175,12 @@ fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
             } else {
                 heading
             };
-            let header_end = header[..header.find(label).unwrap() + label.len()].width();
-            let value_end = build[..build.find(value).unwrap() + value.len()].width();
+            let header_end = find_cell(buf, label).unwrap().0 + label.len() as u16;
+            let aligned_value: String = (header_end - value.len() as u16..header_end)
+                .map(|x| buf[(x, build_y)].symbol())
+                .collect();
             assert_eq!(
-                header_end, value_end,
+                aligned_value, value,
                 "{heading} alignment at {width}: {out}"
             );
         }
@@ -6200,6 +6212,56 @@ fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
         assert_eq!(buf[(x, y)].fg, crate::config::get().colors.ui.error_fg);
         let (x, y) = find_cell(buf, "86%").unwrap();
         assert_eq!(buf[(x, y)].fg, crate::config::get().colors.ui.attention_fg);
+    }
+}
+
+#[test]
+fn host_list_marks_only_connected_servers_with_older_versions() {
+    use crate::backend::{Backend, ConnState};
+    let current = env!("CARGO_PKG_VERSION");
+    for (width, height) in [(120, 40), (80, 24), (60, 22)] {
+        let mut d = host_panel_with_readings(width, height);
+        let Backend::Remote(remote) = d
+            .app
+            .backend_for(&crate::state::HostId("build".into()))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let remote = remote.clone();
+        for (version, outdated) in [
+            (Some("0.0.1"), true),
+            (Some(current), false),
+            (Some("999.0.0"), false),
+            (Some("unknown"), false),
+            (None, false),
+        ] {
+            remote.simulate_server_version_for_tests(version);
+            let out = d.render();
+            let buf = d.terminal.backend().buffer();
+            let (state_x, _) = find_cell(buf, "STATE").unwrap();
+            let (_, row_y) = find_cell(buf, "build").unwrap();
+            assert_eq!(
+                buf[(state_x - 3, row_y)].symbol() == "⚠️",
+                outdated,
+                "{out}"
+            );
+            assert_eq!(out.contains("outdated server"), outdated, "{out}");
+            if outdated {
+                assert_eq!(
+                    buf[(state_x - 3, row_y)].fg,
+                    crate::config::get().colors.ui.attention_fg
+                );
+            }
+        }
+        remote.simulate_server_version_for_tests(Some("0.0.1"));
+        remote.simulate_link_for_tests(ConnState::Connecting, true);
+        assert!(!d.render().contains("⚠️"));
+        remote.simulate_link_for_tests(ConnState::Failed("offline".into()), true);
+        assert!(!d.render().contains("⚠️"));
+        remote.simulate_link_for_tests(ConnState::Connected, true);
+        d.app.host_edit.as_mut().unwrap().rows[1].disabled = true;
+        assert!(!d.render().contains("⚠️"));
     }
 }
 
@@ -7330,7 +7392,7 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
 
 /// A value too long for the card **wraps**; the card grows to hold it.
 ///
-/// Three `-L` forwards is an ordinary set and already outruns the card's width.
+/// Several `-L` forwards can outrun even the wider card's width.
 /// Truncating at the frame was worse here than in the panel's own read-only
 /// rows: the hidden tail was still in the field, saved on `Enter` and editable by
 /// a cursor nothing on screen could place — so the fix is more lines, not an `…`.
@@ -7340,7 +7402,7 @@ fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
     d.app.open_host_edit();
     // This fixture exercises remote rows; localhost is covered separately.
     d.app.host_edit.as_mut().unwrap().rows.clear();
-    let opts = "-L 8010:localhost:8010 -L 8089:localhost:8089 -L 7891:localhost:7891";
+    let opts = "-L 8010:localhost:8010 -L 8020:localhost:8020 -L 8089:localhost:8089 -L 8088:localhost:8088 -L 7891:localhost:7891";
     let state = d.app.host_edit.as_mut().unwrap();
     state.rows.push(super::HostRow {
         options: super::picker::TextInput::with_text(opts),

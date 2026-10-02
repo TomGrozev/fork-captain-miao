@@ -1673,6 +1673,11 @@ impl RemoteBackend {
         *self.latency.lock().unwrap() = latency;
     }
 
+    #[cfg(test)]
+    pub(crate) fn simulate_server_version_for_tests(&self, version: Option<&str>) {
+        *self.server_version.lock().unwrap() = version.map(str::to_owned);
+    }
+
     /// Everything a [`RemoteBackend`] and its connection task share, built but
     /// not yet wired to one. Split out of [`connect`] so a test can hold the
     /// task's half instead of running one.

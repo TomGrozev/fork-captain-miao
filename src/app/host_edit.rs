@@ -471,8 +471,8 @@ impl App {
     }
 
     fn hosts_popup(area: Rect) -> Rect {
-        let width = area.width.saturating_sub(6).min(72);
-        let height = area.height.saturating_sub(2).min(18);
+        let width = area.width.saturating_sub(2).min(104);
+        let height = area.height.saturating_sub(2).min(28);
         Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -514,8 +514,8 @@ impl App {
         };
         let host = view.host.clone();
         let scroll = view.scroll;
-        // Wider and taller than the list: these lines are quoted host output,
-        // and wrapping a loader error at 72 cells helps nobody.
+        // Size the log to the terminal: quoted host output benefits from a
+        // roomy viewport even beyond the list's width cap.
         let popup = centered_rect(88, 76, area);
         clear_overlay(frame, popup);
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
@@ -584,13 +584,25 @@ impl App {
         if popup.width < 10 || popup.height < 7 {
             return;
         }
-        let narrow = popup.width < 64;
+        let narrow = popup.width < 74;
         // Offsets are terminal cells, including each column's reserved gap.
         // Numeric columns share their right edge with the matching heading.
-        let (name, name_width, state_x, ends) = if narrow {
-            (4, 7, 13, [22, 28, 34, 40, 49])
+        // Extra width goes to names; icons and version warnings keep their slots.
+        let name = 7;
+        let (name_width, state_x, ends) = if narrow {
+            let extra = popup.width.saturating_sub(58);
+            (
+                7 + extra,
+                18 + extra,
+                [27, 33, 39, 45, 54].map(|x| x + extra),
+            )
         } else {
-            (4, 10, 17, [32, 39, 46, 53, 66])
+            let extra = popup.width.saturating_sub(74);
+            (
+                9 + extra,
+                20 + extra,
+                [35, 42, 49, 56, 69].map(|x| x + extra),
+            )
         };
         let cfg = config::get();
         let ui = &cfg.colors.ui;
@@ -636,6 +648,7 @@ impl App {
             return;
         }
         let scroll = state.cursor.saturating_sub(visible - 1);
+        let mut has_outdated = false;
         for index in scroll..(scroll + visible).min(state.rows.len() + 1) {
             let y = popup.y + 4 + (index - scroll) as u16;
             let selected = index == state.cursor;
@@ -677,6 +690,19 @@ impl App {
             } else {
                 Style::default().fg(ui.title_fg)
             };
+            let host = row.host();
+            let icon = if row.icon.text().trim().is_empty() {
+                self.host_icon(&host)
+            } else {
+                row.icon.text().trim().to_owned()
+            };
+            left(
+                frame,
+                4,
+                y,
+                ICON_SLOT_WIDTH as u16,
+                Span::styled(icon, style),
+            );
             left(
                 frame,
                 name,
@@ -684,6 +710,24 @@ impl App {
                 name_width,
                 Span::styled(one_line(label, name_width as usize), style),
             );
+            let outdated = !row.disabled
+                && self
+                    .backend_for(&host)
+                    .filter(|backend| backend.conn_state().is_connected())
+                    .and_then(|backend| backend.daemon_version())
+                    .is_some_and(|version| {
+                        super::format::version_is_older(&version, env!("CARGO_PKG_VERSION"))
+                    });
+            if outdated {
+                has_outdated = true;
+                left(
+                    frame,
+                    state_x - 3,
+                    y,
+                    2,
+                    Span::styled("⚠️", Style::default().fg(ui.attention_fg)),
+                );
+            }
             let [connection, sessions, cpu, mem, disk, latency] =
                 self.host_list_values(row, narrow);
             left(frame, state_x, y, if narrow { 6 } else { 10 }, connection);
@@ -694,6 +738,15 @@ impl App {
             {
                 right(frame, end, y, width, value);
             }
+        }
+        if has_outdated {
+            left(
+                frame,
+                3,
+                popup.y + popup.height - 2,
+                popup.width.saturating_sub(6),
+                Span::styled("⚠️ outdated server · Enter for details", dim),
+            );
         }
         if let Some(message) = &state.message {
             left(
@@ -716,9 +769,7 @@ impl App {
         let Some(row) = state.rows.get(state.cursor) else {
             return;
         };
-        let mut popup = Self::hosts_popup(area);
-        popup.height = area.height.saturating_sub(2).min(24);
-        popup.y = area.y + (area.height - popup.height) / 2;
+        let popup = Self::hosts_popup(area);
         clear_overlay(frame, popup);
         let block = Block::default()
             .borders(Borders::ALL)

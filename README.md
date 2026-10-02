@@ -315,6 +315,9 @@ Press `?` in the dashboard for the complete list. The six you'll reach for most:
 | `/`                   | Search                                                                                                                                                                     |
 | `q` / `Ctrl-c`        | Quit                                                                                                                                                                       |
 
+The Hosts panel shows each host's emoji before its name. A `⚠️` marks a connected
+host whose server is older than the dashboard; press `Enter` for version details.
+
 Pressing `Space` (the leader) shows a which-key strip of the available follow-up keys in the footer. `Space t` opens the toggle menu: preview, detail, the session record, and keep-awake. `Space v` publishes or fast-forwards the selected checkout: `p` push, `l` pull (fast-forward only).
 
 Push and pull read fresh checkout status before asking for confirmation, even
