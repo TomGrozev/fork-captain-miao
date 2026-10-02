@@ -4339,6 +4339,10 @@ mod tests {
     #[test]
     fn remote_shell_command_runs_in_cwd_and_returns_to_the_default_shell() {
         let root = std::env::temp_dir().join(format!("cm-work-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Shells resolve symlinked temporary directories, including macOS's
+        // /tmp, so use the physical path for the fixture and expected PWD.
+        let root = root.canonicalize().unwrap();
         let project = root.join("project with spaces");
         std::fs::create_dir_all(&project).unwrap();
         let shell = root.join("login-shell");
