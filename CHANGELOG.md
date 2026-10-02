@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-02
+
+### Added
+
+- **Git status in Detail** shows the current branch, upstream, ahead/behind counts,
+  working-tree changes and conflicts, with `Space v p` to push and `Space v l`
+  to pull (fast-forward only).
+- **Remote work tabs (`w`)** can run a command of your choice, then return to
+  the default login shell.
+
+### Changed
+
+- **The Hosts panel** keeps CPU, memory, disk and latency in a compact list;
+  press `Enter` for details and use Connection, Codex and Services tabs to edit.
+- **Toggle shortcuts** now use `Space t`: `v` for preview, `d` for Detail,
+  `z` for keep-awake and `s` for the session record, with custom bindings
+  supporting up to three chords.
+
+### Fixed
+
+- **The Codex app-server resume picker** now lists editor conversations
+  alongside interactive CLI sessions.
+- **Codex's `/resume` picker** works in app-server mode without disrupting
+  the current session.
+- **Codex cleanup** handles conversations before their first message;
+  restart existing launchers to get the fix.
+- **Grok approval status** stays accurate when summaries update.
+- **Interrupted or exited launchers** no longer leave stale dashboard session
+  rows.
+
 ## [0.9.3] - 2026-09-18
 
 This release only contains release pipeline change. The 0.9.2 version isn't fully
@@ -636,7 +666,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/hyperlogue/captain-miao/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/hyperlogue/captain-miao/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/hyperlogue/captain-miao/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/hyperlogue/captain-miao/compare/v0.9.0...v0.9.1
