@@ -6218,6 +6218,7 @@ fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
 #[test]
 fn host_list_marks_only_connected_servers_with_older_versions() {
     use crate::backend::{Backend, ConnState};
+    use ratatui::style::Modifier;
     let current = env!("CARGO_PKG_VERSION");
     for (width, height) in [(120, 40), (80, 24), (60, 22)] {
         let mut d = host_panel_with_readings(width, height);
@@ -6241,27 +6242,20 @@ fn host_list_marks_only_connected_servers_with_older_versions() {
             let buf = d.terminal.backend().buffer();
             let (state_x, _) = find_cell(buf, "STATE").unwrap();
             let (_, row_y) = find_cell(buf, "build").unwrap();
-            assert_eq!(
-                buf[(state_x - 3, row_y)].symbol() == "⚠️",
-                outdated,
-                "{out}"
-            );
+            assert_eq!(buf[(state_x - 3, row_y)].symbol() == "↑", outdated, "{out}");
             assert_eq!(out.contains("outdated server"), outdated, "{out}");
             if outdated {
-                assert_eq!(
-                    buf[(state_x - 3, row_y)].fg,
-                    crate::config::get().colors.ui.attention_fg
-                );
+                assert!(buf[(state_x - 3, row_y)].modifier.contains(Modifier::DIM));
             }
         }
         remote.simulate_server_version_for_tests(Some("0.0.1"));
         remote.simulate_link_for_tests(ConnState::Connecting, true);
-        assert!(!d.render().contains("⚠️"));
+        assert!(!d.render().contains("↑"));
         remote.simulate_link_for_tests(ConnState::Failed("offline".into()), true);
-        assert!(!d.render().contains("⚠️"));
+        assert!(!d.render().contains("↑"));
         remote.simulate_link_for_tests(ConnState::Connected, true);
         d.app.host_edit.as_mut().unwrap().rows[1].disabled = true;
-        assert!(!d.render().contains("⚠️"));
+        assert!(!d.render().contains("↑"));
     }
 }
 

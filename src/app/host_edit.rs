@@ -720,13 +720,7 @@ impl App {
                     });
             if outdated {
                 has_outdated = true;
-                left(
-                    frame,
-                    state_x - 3,
-                    y,
-                    2,
-                    Span::styled("⚠️", Style::default().fg(ui.attention_fg)),
-                );
+                left(frame, state_x - 3, y, 2, Span::styled("↑", dim));
             }
             let [connection, sessions, cpu, mem, disk, latency] =
                 self.host_list_values(row, narrow);
@@ -745,7 +739,7 @@ impl App {
                 3,
                 popup.y + popup.height - 2,
                 popup.width.saturating_sub(6),
-                Span::styled("⚠️ outdated server · Enter for details", dim),
+                Span::styled("↑ outdated server · Enter for details", dim),
             );
         }
         if let Some(message) = &state.message {
