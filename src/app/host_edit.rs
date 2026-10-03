@@ -502,7 +502,7 @@ impl App {
     }
 
     fn hosts_popup(area: Rect) -> Rect {
-        let width = area.width.saturating_sub(2).min(135);
+        let width = area.width.saturating_sub(2).min(110);
         let height = area.height.saturating_sub(2).min(36);
         Rect::new(
             area.x + (area.width - width) / 2,
