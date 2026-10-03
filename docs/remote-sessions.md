@@ -611,7 +611,9 @@ the full sequence and re-runs it on every reconnect:
    be a command-injection seam out of an environment variable.
 2. **Ensure** — `ssh <target> <exe> daemon ensure` → prints the control-socket
    path; idempotent. Its stderr becomes the `Failed` reason when the probe had
-   nothing to say.
+   nothing to say. A daemon with a vanished socket gets a full five-second
+   socket-check interval plus two seconds of scheduling margin to rebind before
+   recovery considers restarting it; a successful rebind preserves its pool.
 3. **Forward** — cancel any stale forward, then a **forward-only**
    `ssh -N -L <local>:<remote> <target>` child (`kill_on_drop`), under
    `ControlMaster=auto` + per-host `ControlPath` + `BatchMode` (key/agent auth
@@ -643,19 +645,15 @@ the full sequence and re-runs it on every reconnect:
    use the agent while it is forwarded; shortening its lifetime does not make
    an untrusted host safe.
 
-   A host offered the clipboard (the `Clipboard` field, §9) takes **one extra
-   round trip between the cancel and the tunnel child**, and then a second
-   forward on it: a `-R` pointing the host's
-   `~/.cache/captain-miao/clipboard.sock` at this machine's `clipboard serve`
-   socket, synthesized rather than typed but otherwise an ordinary member of the
-   `Forward` list. The round trip is what makes the `-R` bindable, and it does
-   two things a forward spec cannot: `mkdir -p` the parent (ssh creates none, as
-   `ControlPath` taught us) and **`rm -f` the socket path**.
-   The `rm` is the load-bearing half. `streamlocal-forward@openssh.com` carries
-   only a path, so the client-side `StreamLocalBindUnlink` that would handle this
-   is inert for `-R` — a dropped link leaves the socket file behind, and the next
-   reconnect's bind fails on it. Without the prep, the bridge comes back dead
-   exactly once per network blip. Control sockets
+   Clipboard setup runs independently after the protocol handshake. Its `-R`
+   points the host's `~/.cache/captain-miao/clipboard.sock` at a private local
+   relay, which copies bytes to the dashboard's shared `clipboard serve` child.
+   Setup cancels the previously recorded forward before preparing the remote
+   path (`mkdir -p` and `rm -f`) and installing the new destination. Failed or
+   uncertain cancellation prevents rebinding; it does not delay session updates.
+   The prep remains necessary because `streamlocal-forward@openssh.com` carries
+   only a path: client-side `StreamLocalBindUnlink` is inert for `-R`, and a
+   dropped link leaves a socket file that prevents the next bind. Control sockets
    live in a flat `cm-<uid>` dir to stay under the ~104-byte `sockaddr_un`
    limit. **Attach and `w`-shell windows now share that same ControlMaster**
    (`attach_argv`/`remote_shell_argv` both splice `ssh_common_opts`), so
@@ -665,11 +663,24 @@ the full sequence and re-runs it on every reconnect:
    window on that host at once. That's benign — the pooled sessions survive,
    and each window is one `Enter` to reattach (or comes back on its own via
    the auto-reattach sweep, §7).
+
+   Before using the local SSH socket directory, verify it is a directory owned
+   by this user, refuse a symlink, and enforce `0700`; errors stop setup. User
+   forward controls resolve the dial's effective control path with `ssh -G`,
+   then reuse that concrete endpoint without loading unrelated configured
+   forwards. Clipboard cleanup remembers the resolved endpoint too, including
+   after the host is removed or its SSH configuration changes. A private cleanup
+   record contains only the random relay directory name, indexed by a digest of
+   the endpoint; it reconstructs the old forward after a dashboard restart.
+   Failed retirement stays recorded for later cleanup rather than being forgotten.
 4. **Connect** — dial the local socket (with retry; the far end binds a beat
    later).
 5. **Handshake** — `Hello ⇄ Welcome` → `Subscribe` → `Snapshot`. The server's
    version is kept for the hosts panel; a peer below `PROTOCOL_MIN` is refused
-   with a `Failed` reason naming both versions.
+   with a `Failed` reason naming both versions. Hello/Welcome/Subscribe have a
+   fifteen-second deadline; the host becomes Connected after they succeed.
+   Optional user forwards reconcile independently of protocol serving, so their
+   SSH control operations cannot delay session updates.
 6. **Serve** — until drop. On any loss: kill the tunnel child, **clear the
    mirror** (no stale rows), mark `Disconnected`/`Failed`, back off 500ms → 30s
    (reset only after ≥20s healthy, so a flapping host can't storm), retry. Each
@@ -679,7 +690,10 @@ the full sequence and re-runs it on every reconnect:
    Connection loss is determined by the protocol stream. An SSH mux client can
    exit successfully while the shared ControlMaster continues forwarding;
    treating that child exit as a disconnect tears down a healthy connection
-   and repeats the same mistake on every retry.
+   and repeats the same mistake on every retry. The child is still reaped when
+   it exits. Removing/replacing a backend cancels dialing and handshake as well
+   as serving, even if an RPC worker retains a backend reference. Unsent requests
+   whose callers have already timed out are discarded before transmission.
 
 Round-trip time is sampled from ordinary request traffic (`RemoteBackend::request`
 times the oneshot) — there is deliberately **no `Ping` frame**: every reply is
@@ -1325,8 +1339,8 @@ decides what they mean**.
     options become named, independently disabled rows in `hosts.json`. Specs
     retain their exact string; unknown SSH options and quoted argument values
     survive. Opening the panel alone writes nothing. The next explicit edit
-    saves the additive `forwards` field. The clipboard bridge remains owned by
-    the daemon tunnel's existing forwarding path and is not an editable user row.
+    saves the additive `forwards` field. The clipboard bridge has its own grant
+    lifecycle and is not an editable user row.
 - **Advanced SSH options** retain ordinary connection arguments, with shell
   quoting but no shell expansion or execution. Machine identity, `ProxyJump`
   and `IdentityFile` normally belong in `~/.ssh/config`. Invalid quoting stays
@@ -1342,6 +1356,20 @@ decides what they mean**.
     unusual: every other remote feature sends the host what the user asked it to,
     and this one lets the host read something it did not. So the flag is a
     property of one host, and revoking it is the same `Space`.
+  - **Revocation happens locally.** Disabling, suspending or deleting a host
+    synchronously removes its relay socket and shuts down active relay streams,
+    before attempting SSH cleanup. A stalled or surviving master can only reach
+    a dead endpoint. Re-enabling creates a fresh random relay path; old forwards
+    never regain access. Bytes already delivered cannot be withdrawn.
+    Rows sharing the same master and remote clipboard listener share one grant:
+    access ends when the last such row disables it. Independent hosts retain
+    independent relays. Relay sockets are `0600` inside private directories;
+    each relay handles one transfer at a time with a bounded lifetime and no
+    whole-image buffering. Clipboard reads remain on the service's main thread.
+  - **Replacement is serialized by listener.** Old cancellation completes before
+    the remote socket is removed or a new destination is requested. Late cleanup
+    skips listeners held by a live grant, and a retired backend cannot create a
+    new relay even if an RPC worker still holds a reference to it.
   - **A field rather than a panel key**, which the first cut had. The plain
     letters in the list are things you do *to* a row — connect it, delete it,
     upgrade its server — and this is part of what the host **is**, like its

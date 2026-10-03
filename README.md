@@ -560,6 +560,12 @@ and per-host, because while a host is connected anything running as you there
 (including the agent, which runs arbitrary code by design) can read your clipboard
 when it holds an image.
 
+Turning the field off, suspending the host, or deleting it closes its local
+clipboard relay and active transfers immediately, even if SSH cleanup fails.
+Re-enabling uses a fresh relay. If multiple rows share the same SSH master and
+remote clipboard socket, access stays enabled until the last of those rows turns
+it off. Images already received by the remote remain there.
+
 Sharp edges worth knowing:
 
 - **Codex's `Ctrl+V` attaches the image and keeps your draft.** The pool fetches

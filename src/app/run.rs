@@ -3002,12 +3002,13 @@ async fn run_app(terminal: &mut DashboardTerminal) -> Result<()> {
     // sessions keep the shared SSH master alive after the dashboard exits.
     let mut forward_cleanup = tokio::task::JoinSet::new();
     for backend in &app.backends {
-        if let Backend::Remote(remote) = backend
-            && let Some(manager) = remote.forwards.clone()
-        {
-            forward_cleanup.spawn(async move {
-                manager.shutdown().await;
-            });
+        if let Backend::Remote(remote) = backend {
+            remote.retire();
+            if let Some(manager) = remote.forwards.clone() {
+                forward_cleanup.spawn(async move {
+                    manager.shutdown().await;
+                });
+            }
         }
     }
     while forward_cleanup.join_next().await.is_some() {}

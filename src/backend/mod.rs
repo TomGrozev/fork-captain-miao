@@ -53,9 +53,13 @@ pub use cm_core::backend::{
 // *before* a connection exists: nothing else here calls into it except
 // `setup_ssh`, and it calls nothing back except `ConnLog` and the ssh
 // primitives below.
+mod clipboard;
 mod codex_config;
+#[cfg(test)]
+mod connection_tests;
 pub(crate) mod forwards;
 mod provision;
+mod ssh;
 mod vcs;
 pub(crate) use provision::{ConsentPrompt, UpgradeOffer, set_consent_channel, upgrade_host_server};
 use provision::{Provisioning, UploadGate, incompatible_daemon_reason, resolve_remote_exe};
@@ -213,6 +217,9 @@ const ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 /// client only writes to a unix socket — but the master turns it into a global
 /// request and waits for sshd's reply, so it is a round trip like any other.
 const MUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// SSH may remain healthy while the daemon accepts a socket but never replies.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long the host may take to make its clipboard socket path bindable. A
 /// `mkdir` and an `rm` behind a login shell; the generous end of that is a
@@ -1421,7 +1428,7 @@ pub(crate) enum Transport {
         forwards: Vec<crate::ssh_forward::Rule>,
         /// Offer this host the dashboard machine's clipboard — one synthesized
         /// `-R` alongside the user's own forwards. See
-        /// [`clipboard_forward_for_home`].
+        /// [`clipboard_forward`].
         clipboard: bool,
         forward_agent: bool,
     },
@@ -1444,6 +1451,8 @@ struct PendingRequest {
 /// or block on a oneshot for a reply — so callers should be inside
 /// `block_in_place` when they might block (resume list, kill).
 pub(crate) struct RemoteBackend {
+    connection_task: std::sync::OnceLock<tokio::task::AbortHandle>,
+    clipboard: Option<Arc<clipboard::Access>>,
     /// The host this backend speaks for; stamped onto every session it returns.
     host: HostId,
     /// ssh target for the attach window, learned from the transport: `Some` for
@@ -1541,8 +1550,8 @@ pub(crate) struct RemoteBackend {
     /// Whether the mirror holds this host's *account of itself* — set when a
     /// `Snapshot` lands, cleared with the mirror when the link drops.
     ///
-    /// Distinct from `conn == Connected`, which is stored a full round trip
-    /// earlier (before the handshake, let alone the subscribe). In that window a
+    /// Distinct from `conn == Connected`, which is stored after Subscribe,
+    /// before the first Snapshot arrives. In that window a
     /// host has an empty mirror and nothing saying so, which is what the
     /// dashboard's trailing "loading" line exists to prevent — see
     /// [`Backend::awaiting_sessions`].
@@ -1613,8 +1622,25 @@ impl RemoteBackend {
     /// reconnect, until the backend is dropped.
     pub(crate) fn connect(transport: Transport, host: HostId) -> Arc<Self> {
         let (backend, shared, requests) = Self::build(&transport, host);
-        tokio::spawn(connection_task(transport, shared, requests));
+        let task = tokio::spawn(connection_task(transport, shared, requests));
+        let _ = backend.connection_task.set(task.abort_handle());
         backend
+    }
+
+    /// Retirement must interrupt dialing and handshake too, even while an RPC
+    /// worker still holds an Arc to the removed backend.
+    pub(crate) fn retire(&self) {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.revoke();
+        }
+        if let Some(task) = self.connection_task.get() {
+            task.abort();
+        }
+        if let Some(manager) = &self.forwards {
+            manager.retire();
+        }
+        *self.conn.lock().unwrap() = ConnState::Disconnected;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// A backend for a host that never answers — the same construction
@@ -1690,6 +1716,14 @@ impl RemoteBackend {
             Transport::Ssh { options, .. } => split_connection_options(options).0,
             Transport::LocalSocket(_) => Vec::new(),
         };
+        let clipboard = matches!(
+            transport,
+            Transport::Ssh {
+                clipboard: true,
+                ..
+            }
+        )
+        .then(|| Arc::new(clipboard::Access::default()));
         let transport_is_local = matches!(transport, Transport::LocalSocket(_));
         let mirror = Arc::new(Mutex::new(HashMap::new()));
         let presumed_dead = Arc::new(Mutex::new(HashMap::new()));
@@ -1726,6 +1760,7 @@ impl RemoteBackend {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = ConnectionShared {
+            clipboard: clipboard.clone(),
             host: host.clone(),
             forwards: forwards.clone(),
             mirror: mirror.clone(),
@@ -1746,6 +1781,8 @@ impl RemoteBackend {
         // blocking round trip (the resume list) must not be made from the UI
         // thread, and a task can't borrow the `App` that owns the backend.
         let backend = Arc::new(Self {
+            connection_task: Default::default(),
+            clipboard,
             host,
             attach_target,
             ssh_options,
@@ -2064,6 +2101,17 @@ impl RemoteBackend {
             self.request(|req_id| ClientFrame::CheckDir { req_id, path }),
             Some(ServerFrame::DirChecked { exists: true, .. })
         )
+    }
+}
+
+impl Drop for RemoteBackend {
+    fn drop(&mut self) {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.revoke();
+        }
+        if let Some(task) = self.connection_task.get() {
+            task.abort();
+        }
     }
 }
 
@@ -2458,6 +2506,7 @@ enum ServeOutcome {
 /// into a struct rather than passed as seven positional `Arc`s, where the two
 /// `Arc<Mutex<Option<String>>>`s would be swappable at a call site.
 struct ConnectionShared {
+    clipboard: Option<Arc<clipboard::Access>>,
     forwards: Option<Arc<forwards::Manager>>,
     /// Which host this task serves. Needed so a download prompt can name it —
     /// the user may have several, and "may I download a server?" is not a
@@ -2479,10 +2528,10 @@ struct ConnectionShared {
 }
 
 /// Own a [`RemoteBackend`]'s connection for its whole lifetime, reconnecting on
-/// loss. Each iteration establishes the transport, then [`serve`]s one connection
+/// loss. Each iteration establishes the transport, then [`serve_connected`]s one connection
 /// (handshake → subscribe → multiplex the pushed stream into the mirror with
 /// request/response by `req_id`). On loss it clears the mirror, marks the host
-/// disconnected, and retries with exponential backoff — until [`serve`] reports
+/// disconnected, and retries with exponential backoff — until [`serve_connected`] reports
 /// the `RemoteBackend` was dropped, when the task exits.
 async fn connection_task(
     transport: Transport,
@@ -2490,6 +2539,7 @@ async fn connection_task(
     mut requests: mpsc::UnboundedReceiver<PendingRequest>,
 ) {
     let ConnectionShared {
+        clipboard,
         forwards,
         host,
         mirror,
@@ -2558,7 +2608,6 @@ async fn connection_task(
                 target,
                 local_sock,
                 options,
-                clipboard,
                 ..
             } => {
                 log.info(format!("connecting to {target} over ssh"));
@@ -2567,7 +2616,7 @@ async fn connection_task(
                         target,
                         local_sock,
                         options,
-                        clipboard: *clipboard,
+                        clipboard: clipboard.as_deref(),
                     },
                     &remote_exe,
                     &upgrade,
@@ -2637,17 +2686,11 @@ async fn connection_task(
         // dashboard's auto-reattach sweep watches (§7): after a laptop sleep or
         // a broken pipe, every session that *had* an attach window gets one
         // again, without the user re-Entering each row.
-        if was_connected {
-            reconnect_epoch.fetch_add(1, Ordering::Relaxed);
-        }
-        was_connected = true;
-        if let Some(forwards) = &forwards {
-            forwards.connected().await;
-        }
-        log.info("connected");
-        store(ConnState::Connected);
-        let connected_at = Instant::now();
-        let outcome = serve(
+        let mut connected_at = Instant::now();
+        // Optional user forwards must not delay the daemon protocol. Abort any
+        // unfinished reconciliation before recording a disconnect/reconnecting.
+        let mut forward_setup = tokio::task::JoinSet::new();
+        let outcome = serve_connected(
             stream,
             ssh_child,
             MirrorCells {
@@ -2659,8 +2702,25 @@ async fn connection_task(
                 server_version: &server_version,
             },
             &mut requests,
+            || {
+                if was_connected {
+                    reconnect_epoch.fetch_add(1, Ordering::Relaxed);
+                }
+                was_connected = true;
+                connected_at = Instant::now();
+                log.info("connected");
+                store(ConnState::Connected);
+                if let Some(clipboard) = clipboard.clone() {
+                    let log = log.clone();
+                    forward_setup.spawn(async move { clipboard.connect(&log).await });
+                }
+                if let Some(manager) = forwards.clone() {
+                    forward_setup.spawn(async move { manager.connected().await });
+                }
+            },
         )
         .await;
+        forward_setup.shutdown().await;
         // Forget remembered deploy failures and refusals only once the host has
         // *demonstrably* worked — which means the handshake and subscribe both
         // succeeded, not merely that a socket accepted us. Clearing at connect
@@ -2822,7 +2882,7 @@ struct SshLink<'a> {
     /// [`split_connection_options`].
     options: &'a [String],
     /// Offer this host the clipboard — see [`hosts::HostConfig::clipboard`].
-    clipboard: bool,
+    clipboard: Option<&'a clipboard::Access>,
 }
 
 /// Stand up an ssh host: ensure the remote daemon is running (and learn its
@@ -2832,11 +2892,8 @@ struct SshLink<'a> {
 /// or its sessions. The returned child is `kill_on_drop`. Returns None if ssh or
 /// the remote binary fails. Requires key/agent auth (BatchMode).
 ///
-/// The forwards in the host's `options` ride that same child, so they are up for
-/// exactly as long as the host is connected and come back with it on a
-/// reconnect. `ExitOnForwardFailure` stays at its default `no` on purpose: a
-/// port already in use must cost the user that one forward, not the dashboard's
-/// link to the host.
+/// Optional user forwards and clipboard grants start independently after the
+/// handshake. This child owns only the daemon transport.
 async fn setup_ssh(
     link: SshLink<'_>,
     remote_exe: &Arc<Mutex<String>>,
@@ -2851,21 +2908,21 @@ async fn setup_ssh(
         options,
         clipboard,
     } = link;
-    // `forwards` stays owned until the probe reports the host's `$HOME`: the
-    // clipboard forward joins the user's own set, which is what gets it the
-    // cancel-then-request on reconnect, the retirement when the host leaves the
-    // ssh set, and the `port forwards:` log line for free.
-    let (extra, mut forwards) = split_connection_options(options);
+    let (extra, _) = split_connection_options(options);
     let ctl = crate::state::ssh_control_path(target);
     // ssh's ControlMaster won't create ControlPath's parent dir, and the first
     // ssh below (the probe) already needs it — so ensure the short ssh-socket
     // dir exists (0700, so another user can't hijack the control socket).
-    if let Some(dir) = ctl.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Some(dir) = ctl.parent()
+        && let Err(error) = ssh::prepare_socket_dir(dir)
+    {
+        let reason = format!("SSH socket directory is unsafe or inaccessible: {error}");
+        log.error(&reason);
+        *failure = Some(reason);
+        return None;
     }
-    // Every ssh call below carries the host's options; only the tunnel child
-    // carries its forwards.
+    // Every ssh call below carries the host's connection options. Optional
+    // forwards are managed separately after the handshake.
     let opts = ssh_common_opts(&ctl, &extra);
     if !options.is_empty() {
         log.info(format!("connection options: {}", options.join(" ")));
@@ -2906,46 +2963,18 @@ async fn setup_ssh(
     // "connection failed".
     *failure = provisioned.failure;
 
-    // The clipboard bridge: one more `-R`, joining the user's forwards above.
-    // Needs the host's `$HOME`, because ssh does no `~`/`$HOME` expansion in a
-    // forward spec — so a host whose probe failed gets no offer, which costs
-    // nothing since it is about to fail to connect anyway.
-    let clipboard_home = clipboard.then_some(provisioned.home.as_deref()).flatten();
-    if let Some(home) = clipboard_home {
-        let clip_sock = cm_core::clipboard::paths::local_socket_path();
-        log.info(format!(
-            "offering this machine's clipboard at {} on the host",
-            cm_core::clipboard::paths::remote_socket_for_home(home)
-        ));
-        // The one host where the offer cannot become a `Ctrl+V`: an agent reads a
-        // macOS clipboard through `osascript`, which no shim intercepts. Said here
-        // because the alternative is a key that silently does nothing, with the
-        // panel reporting a forward that is genuinely up.
-        if provisioned.darwin {
-            log.info(
-                "this host is a Mac, so Ctrl+V there cannot reach it — \
-                 run `clipboard-paste` in the session instead",
-            );
-        }
-        forwards.push(clipboard_forward(home, &clip_sock));
-    } else if clipboard {
-        log.error("cannot offer the clipboard: the probe never reported the host's home");
-    } else if let Some(home) = provisioned.home.as_deref() {
-        // Revoking must not wait for a *clean* connect. `cancel_user_forwards`
-        // below would take this down, but it sits under `daemon ensure`'s early
-        // return — so a host whose server is broken while its ControlMaster is
-        // still up (any open attach window keeps one) would go on reading this
-        // machine's clipboard until some later reconnect got further, while the
-        // panel says the toggle took effect. Gated on having asked for it, so the
-        // ordinary host that never wanted the clipboard pays nothing.
-        let stale = clipboard_forward(home, &cm_core::clipboard::paths::local_socket_path());
-        if forward_was_requested(prov.host, target, &stale) {
-            log.info("no longer offering this machine's clipboard");
-            cancel_forwards(target, &opts, &[stale]).await;
+    if let Some(clipboard) = clipboard {
+        if let Some(home) = provisioned.home.as_deref() {
+            clipboard.configure(target, &opts, home);
+            if provisioned.darwin {
+                log.info(
+                    "this host is a Mac; run `clipboard-paste` in the session to paste images",
+                );
+            }
+        } else {
+            log.error("cannot offer the clipboard: the probe never reported the host's home");
         }
     }
-    let forwards = forwards.as_slice();
-
     // Ensure the remote daemon is running AND learn its socket path in one call:
     // `daemon ensure` self-daemonizes if needed (idempotent — a no-op against a
     // live one) and prints the socket path on its first stdout line. This starts
@@ -3027,33 +3056,11 @@ async fn setup_ssh(
         .arg(format!("{}:{}", local_sock.display(), remote_sock))
         .arg(target);
     bounded_status(cancel, MUX_CONTROL_TIMEOUT).await;
-    cancel_user_forwards(prov.host, target, &opts, forwards).await;
-
     // Clear any stale local socket and ensure its parent dir exists.
     if let Some(parent) = local_sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::remove_file(local_sock);
-
-    // The same hazard at the far end, and there we cannot run code in the
-    // binding process — so it takes a round trip of its own, after the cancel
-    // above released the path and before the tunnel asks for it.
-    if clipboard_home.is_some() {
-        let script = login_shell_safe(CLIPBOARD_PREP_SCRIPT);
-        let mut prep = detached("ssh");
-        prep.args(&opts).arg(target).arg(&script);
-        let prepared = bounded_status(prep, CLIPBOARD_PREP_TIMEOUT).await;
-        if !prepared {
-            // Not fatal: ssh may still bind (nothing was holding the path), and
-            // if it doesn't, its own stderr file names the listen path. Logged
-            // because this is the step that explains a bridge that never comes
-            // up on an otherwise healthy host.
-            log.error(
-                "could not prepare the host's clipboard socket path; \
-                 the clipboard forward may fail to bind",
-            );
-        }
-    }
 
     // The daemon is already running and persistent, independent of this
     // forward-only child, killed on reconnect with no effect on the daemon.
@@ -3077,22 +3084,6 @@ async fn setup_ssh(
         .arg("-L")
         .arg(format!("{}:{}", local_sock.display(), remote_sock))
         .arg("-N");
-    if !forwards.is_empty() {
-        // Logged, because a forward that fails to bind only says so in ssh's
-        // stderr file — the panel's `l` view should at least show what was asked
-        // for, so "why is nothing on :8080" starts from the right spec.
-        log.info(format!(
-            "port forwards: {}",
-            forwards
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        for f in forwards {
-            cmd.arg(&f.flag).arg(&f.spec);
-        }
-    }
     cmd.arg(target)
         .stderr(stderr)
         .kill_on_drop(true)
@@ -3132,13 +3123,7 @@ const CLIPBOARD_PREP_SCRIPT: &str = concat!(
 
 /// The clipboard bridge as a [`Forward`]: `-R <remote socket>:<local socket>`.
 ///
-/// A synthesized forward rather than a mechanism of its own, because everything a
-/// forward needs is already written — it rides the tunnel child, so it is up for
-/// exactly as long as the host is connected; it gets cancel-then-request on
-/// reconnect from [`cancel_user_forwards`]; it is retired by
-/// [`retire_unlisted_forwards`] when the host is suspended, renamed, deleted or
-/// switched to a socket transport; and it shows up in the `port forwards:` log
-/// line the panel's `l` view already renders.
+/// The local destination is a revocable relay owned by [`clipboard::Access`].
 ///
 /// The remote path is absolute because ssh expands nothing in a forward spec, and
 /// `$HOME`-based because the pool must outlive a login: `/run/user/<uid>` is
@@ -3172,7 +3157,7 @@ static LAST_CONN_OPTIONS: LazyLock<Mutex<ConnOptionsMemo>> = LazyLock::new(Mutex
 /// the new options either way.
 ///
 /// The `extra` half only, never the forwards: a `-L`/`-R` is requested through
-/// the master per connection and [`cancel_user_forwards`] already re-asks for it
+/// the master per connection and the live forward managers re-ask for it
 /// on every pass, so an edit that only moves a forward needs no teardown.
 /// Everything left in `extra` is the opposite — `Port`, `User`, `IdentityFile`,
 /// `ProxyJump`, the ciphers, and the `ConnectTimeout`/`ServerAliveInterval`/
@@ -3235,121 +3220,10 @@ fn options_changed_since_last_dial(host: &HostId, target: &str, extra: &[String]
     changed_connection_options(host, target, extra).is_some()
 }
 
-/// Every port-forward spec this process has asked a given ssh target's
-/// ControlMaster for, so the next connect can take them back down.
-///
-/// A forward requested by a multiplexed *client* is registered with the
-/// **master**, not with the client's own session — which is why the transport's
-/// `-L` needs its own `-O cancel` above, and why a forward the user has since
-/// deleted would otherwise hold its port until the master itself expires
-/// (`ControlPersist`, refreshed by every attach window). Nothing enumerates a
-/// master's live forwards, so remembering what we asked for is the only way to
-/// name them again.
-///
-/// Keyed by `(host label, ssh target)` rather than by target alone: two panel
-/// rows may name the same machine, and each has to manage its own set — keyed
-/// only by target, connecting one would tear down the other's forwards.
-static REQUESTED_FORWARDS: LazyLock<Mutex<HashMap<ForwardKey, Vec<Forward>>>> =
-    LazyLock::new(Mutex::default);
-
-/// `(host label, ssh target)` — which panel row's forwards these are, and where
-/// they were asked for. See [`REQUESTED_FORWARDS`].
+/// `(host label, ssh target)` identifies one row in the connection-options memo.
 type ForwardKey = (String, String);
 
-/// Whether this process has asked *this* host's master for exactly this forward.
-///
-/// For cancelling one remembered forward on its own, ahead of the wholesale
-/// cancel-then-request in [`cancel_user_forwards`] — which is too late for
-/// anything that must come down even when the connect goes on to fail. The memo
-/// is left alone: the next successful connect replaces it, and until then a cancel
-/// that didn't take is worth retrying.
-fn forward_was_requested(host: &HostId, target: &str, f: &Forward) -> bool {
-    REQUESTED_FORWARDS
-        .lock()
-        .unwrap()
-        .get(&(host.0.clone(), target.to_string()))
-        .is_some_and(|seen| seen.contains(f))
-}
-
-/// Cancel every forward this process has requested for this host, including the
-/// ones about to be re-requested.
-///
-/// Cancelling the *current* set too is not waste: a re-request of a forward the
-/// master already holds fails, and unlike the transport's unix socket (where the
-/// master quietly binds nothing) a mux client treats a refused forward request
-/// as fatal — so leaving a live one in place is how a reconnect would kill the
-/// very child it just spawned. Cancel-then-request is idempotent; the forward is
-/// down only for the moment the connection is being re-established anyway.
-///
-/// Every failure here is expected and ignorable: no master up yet (the first
-/// connect), no such forward (the common case), or an ssh too old to cancel a
-/// dynamic one. `detached` swallows the diagnostics.
-async fn cancel_user_forwards(host: &HostId, target: &str, opts: &[String], forwards: &[Forward]) {
-    let stale = {
-        let mut memo = REQUESTED_FORWARDS.lock().unwrap();
-        let seen = memo
-            .entry((host.0.clone(), target.to_string()))
-            .or_default();
-        let mut all = std::mem::replace(seen, forwards.to_vec());
-        for f in forwards {
-            if !all.contains(f) {
-                all.push(f.clone());
-            }
-        }
-        all
-    };
-    cancel_forwards(target, opts, &stale).await;
-}
-
-/// Retire the forwards of every host that is no longer asking for one — it was
-/// deleted, suspended, renamed, or switched to a socket transport.
-///
-/// Dropping the backend kills its ssh child, but a forward outlives that child
-/// by construction (it belongs to the master, see [`REQUESTED_FORWARDS`]), and
-/// any open attach window keeps that master alive indefinitely. Without this,
-/// suspending a host would leave its ports answered by a machine the panel says
-/// is disconnected — with nothing left running to name the forward and take it
-/// back down.
-///
-/// `live` is `(label, target)` for every host that will still get an ssh
-/// backend. Fire-and-forget: the caller is committing a panel edit and must not
-/// block on an ssh round trip per forward.
-pub(crate) fn retire_unlisted_forwards(live: &[ForwardKey]) {
-    let retired: Vec<(ForwardKey, Vec<Forward>)> = {
-        let mut memo = REQUESTED_FORWARDS.lock().unwrap();
-        let gone: Vec<ForwardKey> = memo.keys().filter(|k| !live.contains(k)).cloned().collect();
-        gone.into_iter()
-            .filter_map(|k| memo.remove(&k).map(|f| (k, f)))
-            .collect()
-    };
-    for ((_, target), forwards) in retired {
-        if forwards.is_empty() {
-            continue;
-        }
-        tokio::spawn(async move {
-            let opts = ssh_common_opts(&state::ssh_control_path(&target), &[]);
-            cancel_forwards(&target, &opts, &forwards).await;
-        });
-    }
-}
-
-/// One `-O cancel` per spec rather than one command carrying all of them: a
-/// single unsupported flag would fail the whole batch, taking the forwards that
-/// *could* have been cancelled down with it.
-async fn cancel_forwards(target: &str, opts: &[String], forwards: &[Forward]) {
-    for f in forwards {
-        let mut cmd = detached("ssh");
-        cmd.args(opts)
-            .arg("-O")
-            .arg("cancel")
-            .arg(&f.flag)
-            .arg(&f.spec)
-            .arg(target);
-        bounded_status(cmd, MUX_CONTROL_TIMEOUT).await;
-    }
-}
-
-/// The cells [`serve`] writes as frames arrive, borrowed as a group. Grouped for
+/// The cells [`serve_connected`] writes as frames arrive, borrowed as a group. Grouped for
 /// the same reason as [`SshLink`]: they would otherwise be six more positional
 /// parameters, four of them `&Arc<Mutex<…>>` and two `&Arc<AtomicBool>` — types
 /// that say nothing at a call site about which is which.
@@ -3371,11 +3245,41 @@ struct MirrorCells<'a> {
 /// still cleans up a standalone tunnel. Its exit is not a disconnect signal:
 /// a mux client can exit successfully while the ControlMaster keeps forwarding.
 /// The protocol stream is the authority on connection loss.
-async fn serve(
+async fn serve_connected(
     stream: UnixStream,
-    _ssh_child: Option<tokio::process::Child>,
+    mut ssh_child: Option<tokio::process::Child>,
     cells: MirrorCells<'_>,
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
+    connected: impl FnOnce(),
+) -> ServeOutcome {
+    let serving = serve_protocol(stream, cells, requests, connected);
+    tokio::pin!(serving);
+    if let Some(child) = &mut ssh_child {
+        tokio::select! {
+            outcome = &mut serving => outcome,
+            // Reap an exited mux client without ending a healthy protocol link.
+            _ = child.wait() => serving.await,
+        }
+    } else {
+        serving.await
+    }
+}
+
+#[cfg(test)]
+async fn serve(
+    stream: UnixStream,
+    ssh_child: Option<tokio::process::Child>,
+    cells: MirrorCells<'_>,
+    requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
+) -> ServeOutcome {
+    serve_connected(stream, ssh_child, cells, requests, || {}).await
+}
+
+async fn serve_protocol(
+    stream: UnixStream,
+    cells: MirrorCells<'_>,
+    requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
+    connected: impl FnOnce(),
 ) -> ServeOutcome {
     let MirrorCells {
         mirror,
@@ -3388,45 +3292,57 @@ async fn serve(
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
 
-    // Handshake + subscribe.
-    let hello = ClientFrame::Hello {
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol: PROTOCOL_VERSION,
-    };
-    if write_frame(&mut wr, &hello).await.is_err() {
-        tracing::warn!(target: "captain_miao::ssh", "failed to send Hello");
-        return ServeOutcome::HandshakeFailed(None);
-    }
-    match read_frame::<_, ServerFrame>(&mut rd).await {
-        Ok(Some(ServerFrame::Welcome {
-            protocol,
-            server_version: sv,
-            ..
-        })) => {
-            // Only a server *below* the floor is refused — a newer one is fine,
-            // since both sides decode unknown frames/fields tolerantly (§3).
-            if !protocol_compatible(protocol) {
-                tracing::warn!(
-                    target: "captain_miao::ssh",
-                    "server speaks protocol {protocol}, below our floor {PROTOCOL_MIN}"
-                );
-                return ServeOutcome::HandshakeFailed(Some(incompatible_daemon_reason(
-                    &sv, protocol,
-                )));
+    let handshake = async {
+        // Handshake + subscribe.
+        let hello = ClientFrame::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: PROTOCOL_VERSION,
+        };
+        if write_frame(&mut wr, &hello).await.is_err() {
+            tracing::warn!(target: "captain_miao::ssh", "failed to send Hello");
+            return Err(ServeOutcome::HandshakeFailed(None));
+        }
+        match read_frame::<_, ServerFrame>(&mut rd).await {
+            Ok(Some(ServerFrame::Welcome {
+                protocol,
+                server_version: sv,
+                ..
+            })) => {
+                // Only a server *below* the floor is refused — a newer one is fine,
+                // since both sides decode unknown frames/fields tolerantly (§3).
+                if !protocol_compatible(protocol) {
+                    tracing::warn!(
+                        target: "captain_miao::ssh",
+                        "server speaks protocol {protocol}, below our floor {PROTOCOL_MIN}"
+                    );
+                    return Err(ServeOutcome::HandshakeFailed(Some(
+                        incompatible_daemon_reason(&sv, protocol),
+                    )));
+                }
+                tracing::debug!(target: "captain_miao::ssh", "handshake ok (protocol {protocol}, server {sv})");
+                *server_version.lock().unwrap() = Some(sv);
             }
-            tracing::debug!(target: "captain_miao::ssh", "handshake ok (protocol {protocol}, server {sv})");
-            *server_version.lock().unwrap() = Some(sv);
+            // No usable Welcome at all: something is answering the socket that
+            // isn't our daemon, or it hung up mid-handshake.
+            other => {
+                tracing::warn!(target: "captain_miao::ssh", "handshake failed, no usable Welcome: {other:?}");
+                return Err(ServeOutcome::HandshakeFailed(None));
+            }
         }
-        // No usable Welcome at all: something is answering the socket that
-        // isn't our daemon, or it hung up mid-handshake.
-        other => {
-            tracing::warn!(target: "captain_miao::ssh", "handshake failed, no usable Welcome: {other:?}");
-            return ServeOutcome::HandshakeFailed(None);
+        if write_frame(&mut wr, &ClientFrame::Subscribe).await.is_err() {
+            tracing::warn!(target: "captain_miao::ssh", "failed to send Subscribe");
+            return Err(ServeOutcome::HandshakeFailed(None));
         }
-    }
-    if write_frame(&mut wr, &ClientFrame::Subscribe).await.is_err() {
-        tracing::warn!(target: "captain_miao::ssh", "failed to send Subscribe");
-        return ServeOutcome::HandshakeFailed(None);
+
+        Ok(())
+    };
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(())) => connected(),
+        Ok(Err(outcome)) => return outcome,
+        Err(_) => {
+            tracing::warn!(target: "captain_miao::ssh", "protocol handshake timed out");
+            return ServeOutcome::HandshakeFailed(Some("Protocol handshake timed out".into()));
+        }
     }
 
     let mut pending: HashMap<u64, oneshot::Sender<ServerFrame>> = HashMap::new();
@@ -3513,6 +3429,9 @@ async fn serve(
                     // that timed out). A server that never answers a frame it can't
                     // decode would otherwise leave one behind per attempt, for as
                     // long as the connection lasts.
+                    if req.reply.is_closed() {
+                        continue;
+                    }
                     pending.retain(|_, tx| !tx.is_closed());
                     pending.insert(req.req_id, req.reply);
                     if write_frame(&mut wr, &req.frame).await.is_err() {
@@ -4109,44 +4028,6 @@ mod tests {
         // otherwise).
         let wrapped = login_shell_safe(CLIPBOARD_PREP_SCRIPT);
         assert!(wrapped.starts_with("/bin/sh -c '") && wrapped.ends_with('\''));
-    }
-
-    /// Turning the clipboard off has to be cancellable on its own, ahead of the
-    /// wholesale pass in `cancel_user_forwards` — that one sits under `daemon
-    /// ensure`'s early return, so a host whose server is broken would keep the
-    /// `-R` while the panel says the toggle applied.
-    #[test]
-    fn a_revoked_clipboard_forward_is_nameable_on_its_own() {
-        let host = HostId("revoke-probe".to_string());
-        let target = "user@box";
-        let home = "/home/miao";
-        let f = clipboard_forward(home, Path::new("/run/user/1000/x/clipboard.sock"));
-        // Nothing asked for yet: an ordinary host that never wanted the clipboard
-        // must pay no `-O cancel` on any of its connects.
-        assert!(!forward_was_requested(&host, target, &f));
-
-        REQUESTED_FORWARDS
-            .lock()
-            .unwrap()
-            .insert((host.0.clone(), target.to_string()), vec![f.clone()]);
-        assert!(forward_was_requested(&host, target, &f));
-        // Keyed by (label, target), so one row's forwards are never another's —
-        // two panel rows may well name the same machine.
-        assert!(!forward_was_requested(
-            &HostId("other".to_string()),
-            target,
-            &f
-        ));
-        assert!(!forward_was_requested(&host, "user@elsewhere", &f));
-        // And the spec has to match exactly, since that is what `-O cancel` names:
-        // a different local socket is a different forward.
-        let elsewhere = clipboard_forward(home, Path::new("/run/user/1000/y/clipboard.sock"));
-        assert!(!forward_was_requested(&host, target, &elsewhere));
-
-        REQUESTED_FORWARDS
-            .lock()
-            .unwrap()
-            .remove(&(host.0.clone(), target.to_string()));
     }
 
     /// The tail of an ssh argv after the `-o` option block, so the assertions

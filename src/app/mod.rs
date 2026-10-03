@@ -2689,9 +2689,8 @@ impl App {
         for (i, backend) in live.iter().enumerate() {
             if !plan.contains(&Some(i))
                 && let Some(Backend::Remote(remote)) = backend
-                && let Some(manager) = &remote.forwards
             {
-                manager.retire();
+                remote.retire();
             }
         }
         for (identity, slot) in want.iter().zip(&plan) {
@@ -2728,8 +2727,8 @@ impl App {
                 self.reconnect_epochs.remove(&host);
             }
         }
-        // Dropping the last `Arc` closes the connection task's request channel,
-        // which is how it learns to stop (and takes its ssh child with it).
+        // Removed backends were retired before dialing their replacements,
+        // including those still held by an in-flight RPC worker.
         drop(live);
         self.backend_identities = want;
         // Cheap and idempotent for a carried-over backend: `subscribe` hands back
@@ -2919,27 +2918,7 @@ impl App {
         self.extra_prefs.host_order = Some(state.host_order());
         self.save_overrides();
         hosts::save_hosts(&configs);
-        // A host that just left the ssh set — deleted, suspended, renamed, or
-        // switched to a socket — still holds its port forwards on the shared
-        // ControlMaster, which outlives the backend about to be dropped (and
-        // which an open attach window keeps alive indefinitely). Retire them
-        // before the reconcile, while there is still a record of what they were.
-        // A no-op when nothing left the set, which is the common case now that
-        // this runs on every commit rather than behind a changed-anything gate.
-        crate::backend::retire_unlisted_forwards(&Self::forward_keys(&configs));
         self.reconcile_backends_from(&configs);
-    }
-
-    /// `(label, ssh target)` for every host that will still get an ssh backend —
-    /// the live set [`crate::backend::retire_unlisted_forwards`] measures
-    /// against. A suspended or socket host is *absent*, not present-and-empty:
-    /// it dials nothing, so nothing should be forwarding on its behalf.
-    fn forward_keys(hosts: &[hosts::HostConfig]) -> Vec<(String, String)> {
-        hosts
-            .iter()
-            .filter(|h| !h.disabled && h.socket.is_none())
-            .filter_map(|h| Some((h.label.clone(), h.ssh.clone()?)))
-            .collect()
     }
 
     /// The per-host emoji for the icon column. A suspended host keeps its icon —

@@ -39,11 +39,16 @@ struct SshControl {
     generation: u64,
     retiring: Arc<AtomicBool>,
     options: Vec<String>,
+    endpoint: tokio::sync::OnceCell<Vec<String>>,
 }
 
 #[async_trait::async_trait]
 impl Control for SshControl {
     async fn execute(&self, f: &Forward, add: bool) -> Result<(), String> {
+        let options = self
+            .endpoint
+            .get_or_try_init(|| ssh::control_options(&self.target, &self.options))
+            .await?;
         let ownership = OWNERS
             .lock()
             .unwrap()
@@ -77,7 +82,7 @@ impl Control for SshControl {
             retiring: self.retiring.clone(),
         });
         let mut cmd = detached("ssh");
-        cmd.args(&self.options)
+        cmd.args(options)
             .arg("-O")
             .arg(if add { "forward" } else { "cancel" })
             .arg(&f.flag)
@@ -106,7 +111,7 @@ impl Control for SshControl {
 
 /// OpenSSH's mux cancel path exits zero even after a refused request. Its
 /// diagnostic distinguishes a failure from a listener already absent.
-fn control_result(success: bool, stderr: &str, add: bool) -> Result<(), String> {
+pub(super) fn control_result(success: bool, stderr: &str, add: bool) -> Result<(), String> {
     let error = stderr.trim();
     if !add && error.contains("port not forwarded") {
         return Ok(());
@@ -124,41 +129,10 @@ fn control_result(success: bool, stderr: &str, add: bool) -> Result<(), String> 
     })
 }
 
-/// Mux controls need only the socket selection, never authentication, proxy,
-/// or forwarding options. Ignore ssh_config too: its LocalForward entries
-/// would otherwise join every `-O cancel` and be removed along with our rule.
-fn control_options(target: &str, options: &[String]) -> Vec<String> {
-    let mut out = vec!["-F".into(), "/dev/null".into()];
-    let mut rest = options.iter();
-    while let Some(option) = rest.next() {
-        if option == "-S" {
-            if let Some(path) = rest.next() {
-                out.extend([option.clone(), path.clone()]);
-            }
-        } else if let Some(value) = option.strip_prefix("-o").filter(|s| !s.is_empty()) {
-            if value.to_ascii_lowercase().starts_with("controlpath=") {
-                out.push(option.clone());
-            }
-        } else if option == "-o" {
-            if let Some(value) = rest.next()
-                && value.to_ascii_lowercase().starts_with("controlpath=")
-            {
-                out.extend([option.clone(), value.clone()]);
-            }
-        } else if option.starts_with("-S") {
-            out.push(option.clone());
-        }
-    }
-    out.extend([
-        "-o".into(),
-        format!("ControlPath={}", state::ssh_control_path(target).display()),
-    ]);
-    out
-}
-
 #[derive(Default)]
 struct Live {
     online: bool,
+    retired: bool,
     active: HashSet<Forward>,
     // Includes uncertain requests: a timeout may have installed a listener.
     requested: HashSet<Forward>,
@@ -198,7 +172,8 @@ impl Manager {
                 host: host.clone(),
                 generation: GENERATION.fetch_add(1, Ordering::Relaxed),
                 retiring: closed.clone(),
-                options: control_options(target, options),
+                options: ssh_common_opts(&state::ssh_control_path(target), options),
+                endpoint: Default::default(),
             }),
             closed,
             wanted: Mutex::new(enabled(rules)),
@@ -398,6 +373,9 @@ impl Manager {
         // remembered/requested specs before asking again, as setup_ssh does.
         let stale: HashSet<_> = live.requested.iter().chain(&wanted).cloned().collect();
         for f in &stale {
+            if self.closed.load(Ordering::Relaxed) {
+                return;
+            }
             // A failed retirement stays remembered and visible, even if the
             // user disabled the rule while disconnected.
             live.requested.insert(f.clone());
@@ -406,6 +384,9 @@ impl Manager {
         live.active.clear();
         live.online = true;
         for f in &wanted {
+            if self.closed.load(Ordering::Relaxed) {
+                return;
+            }
             let _ = self.add(&mut live, f).await;
         }
     }
@@ -435,6 +416,11 @@ impl Manager {
     pub(crate) async fn shutdown(&self) {
         self.closed.store(true, Ordering::Relaxed);
         let mut live = self.live.lock().await;
+        // Explicit removal, task drop, and dashboard shutdown can all join
+        // retirement. The lock makes them await one cleanup attempt.
+        if live.retired {
+            return;
+        }
         live.online = false;
         // Independent listeners can retire together. A dead mux must cost one
         // timeout on quit, not one timeout for every configured port.
@@ -456,6 +442,7 @@ impl Manager {
                 Err(error) => self.report(&f, Status::Failed(error)),
             }
         }
+        live.retired = true;
     }
 }
 
@@ -475,6 +462,78 @@ impl Drop for Lifetime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StalledControl(Arc<tokio::sync::Notify>, AtomicBool);
+    #[async_trait::async_trait]
+    impl Control for StalledControl {
+        async fn execute(&self, _: &Forward, _: bool) -> Result<(), String> {
+            if self.1.swap(true, Ordering::Relaxed) {
+                return Ok(());
+            }
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_forwards_do_not_block_protocol_or_retirement() {
+        let root = scratch_home("independent-forwards");
+        let socket = root.join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let transport = Transport::LocalSocket(socket);
+        let (backend, mut shared, requests) =
+            RemoteBackend::build(&transport, HostId("test".into()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let manager = Arc::new(Manager {
+            control: Arc::new(StalledControl(entered.clone(), AtomicBool::new(false))),
+            closed: Default::default(),
+            wanted: Mutex::new(enabled(&crate::ssh_forward::import("3000").unwrap())),
+            live: Default::default(),
+            statuses: Default::default(),
+            dirty: Default::default(),
+            log: Default::default(),
+        });
+        shared.forwards = Some(manager.clone());
+        let task = tokio::spawn(connection_task(transport, shared, requests));
+        backend.connection_task.set(task.abort_handle()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                read_frame::<_, ClientFrame>(&mut peer).await.unwrap(),
+                Some(ClientFrame::Hello { .. })
+            ));
+            assert_eq!(backend.conn_state(), ConnState::Connecting);
+            write_frame(
+                &mut peer,
+                &ServerFrame::Welcome {
+                    server_version: "test".into(),
+                    protocol: PROTOCOL_VERSION,
+                    host: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_frame::<_, ClientFrame>(&mut peer).await.unwrap(),
+                Some(ClientFrame::Subscribe)
+            ));
+            entered.notified().await;
+            assert_eq!(backend.conn_state(), ConnState::Connected);
+            write_frame(&mut peer, &ServerFrame::Snapshot { sessions: vec![] })
+                .await
+                .unwrap();
+            while !backend.mirrored.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            backend.retire();
+            assert!(task.await.unwrap_err().is_cancelled());
+            // Forward reconciliation releases its lock when the owner exits.
+            let _live = manager.live.lock().await;
+        })
+        .await
+        .expect("optional forward setup blocked the connection lifecycle");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// Exercise the real OpenSSH client against a tiny mux peer. No SSH daemon,
     /// authentication, TCP listener, or user connection is involved. This pins
@@ -550,7 +609,8 @@ mod tests {
             host: HostId("example".into()),
             generation,
             retiring: Arc::new(AtomicBool::new(false)),
-            options: control_options(&target, &[]),
+            options: ssh_common_opts(&state::ssh_control_path(&target), &[]),
+            endpoint: Default::default(),
         };
         let old = control(generation);
         let rule = crate::ssh_forward::import("3000")
@@ -605,17 +665,6 @@ mod tests {
             .is_err()
         );
         assert!(control_result(true, "", false).is_ok());
-        let options = shell_words::split("-L3000:localhost:3000 -o 'LocalForward=9000 localhost:9000' -F /path/to/config -o ControlPath=/path/to/mux").unwrap();
-        let control = control_options("test-target", &options);
-        assert_eq!(
-            &control[..4],
-            ["-F", "/dev/null", "-o", "ControlPath=/path/to/mux"]
-        );
-        assert!(
-            !control
-                .iter()
-                .any(|s| s.contains("3000") || s.contains("9000") || s == "/path/to/config")
-        );
     }
 
     #[derive(Default)]
