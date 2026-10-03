@@ -251,7 +251,9 @@ fn heal_wedged_daemon() -> bool {
 
 /// How long a lock-holding daemon with an unreachable socket is given to come
 /// back (bind, or rebind after the runtime dir returns) before it's restarted.
-const WEDGE_GRACE: Duration = Duration::from_secs(3);
+/// Cover a complete socket-check interval plus scheduling margin: killing it
+/// sooner can destroy healthy pooled sessions just before their next rebind.
+const WEDGE_GRACE: Duration = Duration::from_secs(SOCKET_CHECK.as_secs() + 2);
 
 /// Daemonize, set the process up, and serve forever. Split from [`ensure`] so
 /// the wedge-recovery path can re-enter it with a freshly acquired lock.
