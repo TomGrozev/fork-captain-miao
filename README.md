@@ -489,9 +489,12 @@ The panel lists host, connection state, session count, CPU, memory, disk, and
 latency in aligned columns. Disk measures space used on the host's home
 filesystem. All three percentages use the attention color at 80% and the error
 color at 90% (yellow and red by default). `Enter` opens details, including full
-failure messages, connection settings, and the daemon version. `e` edits the
-host in Connection, Codex, and Services tabs; `Alt+1/2/3` switches tabs and Tab
-walks their fields. Enter applies edits and Escape cancels the entire draft.
+failure messages, connection settings, and the daemon version, with labeled
+values and two columns when the terminal has room. `e` edits the
+host in one form grouped into Connection, Codex, and Services; Tab or `↑`/`↓`
+walks all fields, and `Alt+1/2/3` jumps to a section without hiding the others.
+The form scrolls to keep the focused field visible on smaller terminals.
+Enter applies edits and Escape cancels the entire draft.
 `J`/`K` reorder hosts; the first usable host is the default for new sessions.
 `?` shows host commands, including `l` for the connection log, `c` to suspend or
 reconnect, `f` for port forwards, and `u` to upgrade the server when available.
@@ -513,9 +516,9 @@ reconnect, `f` for port forwards, and `u` to upgrade the server when available.
 - **Advanced SSH options** accepts quoted SSH arguments; machine setup normally
   belongs in `~/.ssh/config`. Changing these connection options can reconnect
   the host. The forwarding list manages ports independently.
-- **Git SSH agent** — edit an SSH host with `Space h` → `e`, open Services
-  (`Alt+3`), and toggle this field with Space. Off by default; Enter applies it
-  to subsequent Git commands without reconnecting the host. Push/pull network
+- **Git SSH agent** — edit an SSH host with `Space h` → `e`, find this field
+  under Services (`Alt+3`), and toggle it with Space. Off by default; Enter
+  applies it to subsequent Git commands without reconnecting the host. Push/pull network
   requests open a fresh SSH connection with agent forwarding, pass its socket
   only to that Git request, and close it when the request ends. Pull preparation
   also uses a short connection to check and fetch the remote branch; forwarding

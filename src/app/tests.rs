@@ -6122,7 +6122,7 @@ fn host_panel_with_readings(width: u16, height: u16) -> TestDashboard {
 
 #[test]
 fn host_list_aligns_sessions_and_live_readings_at_terminal_sizes() {
-    for (width, height) in [(120, 40), (100, 28), (80, 24), (60, 22)] {
+    for (width, height) in [(160, 45), (120, 40), (100, 28), (80, 24), (60, 22)] {
         let mut d = host_panel_with_readings(width, height);
         let out = d.render();
         let header = out
@@ -6319,7 +6319,10 @@ fn host_details_help_and_nested_views_keep_modal_ownership() {
     assert_eq!(d.app.host_edit.as_ref().unwrap().view, HostView::Details);
     let out = d.render();
     assert!(
-        out.contains("ssh test-target") && out.contains("CPU 34%"),
+        out.contains("test-target")
+            && out
+                .lines()
+                .any(|line| line.contains("CPU") && line.contains("34%")),
         "{out}"
     );
     assert!(d.app.host_edit.as_ref().unwrap().edit.is_none());
@@ -6388,7 +6391,107 @@ fn host_details_help_and_nested_views_keep_modal_ownership() {
 }
 
 #[test]
-fn host_editor_tabs_hide_other_settings_and_cancel_the_entire_draft() {
+fn host_details_reflow_keep_values_readable_and_explain_defaults() {
+    use cm_core::agents::codex::{CodexConfig, CodexMode};
+    use ratatui::style::Modifier;
+    for (width, height) in [(160, 45), (120, 32), (80, 32), (60, 22)] {
+        let mut d = host_panel_with_readings(width, height);
+        let panel = d.app.host_edit.as_mut().unwrap();
+        panel.cursor = 2;
+        let row = &mut panel.rows[2];
+        row.codex = Some(CodexConfig {
+            mode: CodexMode::AppServer,
+            ..Default::default()
+        });
+        row.codex_endpoint.set_text("unix://");
+        row.codex_error = None;
+        row.clipboard = true;
+        row.forwards = crate::ssh_forward::import("3000 4000").unwrap();
+        row.forwards[1].disabled = true;
+        d.press(KeyCode::Enter);
+        let out = d.render();
+        let buf = d.terminal.backend().buffer();
+        let (cx, cy) = find_cell(buf, "Connection").unwrap();
+        assert!(buf[(cx, cy)].modifier.contains(Modifier::BOLD), "{out}");
+        let (vx, vy) = find_cell(buf, "92%").unwrap();
+        assert_eq!(buf[(vx, vy)].fg, crate::config::get().colors.ui.error_fg);
+        assert!(!buf[(vx, vy)].modifier.contains(Modifier::DIM));
+        let (mx, my) = find_cell(buf, "73%").unwrap();
+        assert!(!buf[(mx, my)].modifier.contains(Modifier::DIM));
+        if width >= 120 {
+            let (codex_x, codex_y) = find_cell(buf, "Codex").unwrap();
+            assert!(
+                codex_x > cx && codex_y == cy,
+                "wide view puts related sections side by side: {out}"
+            );
+            assert!(
+                out.contains("Default Unix socket") && out.contains("1 enabled / 2 total"),
+                "{out}"
+            );
+        } else if width == 80 {
+            let (codex_x, codex_y) = find_cell(buf, "Codex").unwrap();
+            assert!(
+                codex_x == cx && codex_y > cy,
+                "narrow view stacks sections: {out}"
+            );
+        }
+        d.press(KeyCode::End);
+        let bottom = d.render();
+        assert!(
+            bottom.contains("1 enabled / 2 total") && bottom.contains("Default shell"),
+            "all services remain reachable: {bottom}"
+        );
+    }
+}
+
+#[test]
+fn host_editor_scrolls_long_values_and_keeps_help_visible() {
+    use super::HostField;
+    let mut d = host_panel_with_readings(60, 14);
+    let state = d.app.host_edit.as_mut().unwrap();
+    let options = "-o SendEnv=EXAMPLE_ONE -o SendEnv=EXAMPLE_TWO -o SendEnv=EXAMPLE_THREE";
+    state.rows[1].options.set_text(options);
+    state.begin_edit(HostField::Options);
+    let out = d.render();
+    assert!(
+        out.contains("EXAMPLE_THREE"),
+        "the input cursor's line must be visible: {out}"
+    );
+    assert!(
+        out.contains("Quoted SSH arguments"),
+        "contextual help must remain pinned: {out}"
+    );
+    d.press(KeyCode::Home);
+    assert!(d.render().contains("Advanced SSH options"));
+    d.app
+        .host_edit
+        .as_mut()
+        .unwrap()
+        .edit
+        .as_mut()
+        .unwrap()
+        .focus = HostField::ShellCommand;
+    let out = d.render();
+    assert!(
+        out.contains("Work tab command") && out.contains("empty = default shell"),
+        "{out}"
+    );
+    assert!(!out.contains("[3 Services]"));
+    d.press(KeyCode::Tab);
+    let out = d.render();
+    assert!(
+        out.contains("Label") && out.contains("Target"),
+        "wrapping field focus returns to the start: {out}"
+    );
+    d.press(KeyCode::Esc);
+    assert_eq!(
+        d.app.host_edit.as_ref().unwrap().rows[1].options.text(),
+        options
+    );
+}
+
+#[test]
+fn host_editor_shows_one_form_and_cancels_the_entire_draft() {
     use super::HostField;
     use cm_core::agents::codex::{CodexConfig, CodexMode};
     let mut d = TestDashboard::new(80, 24);
@@ -6400,8 +6503,27 @@ fn host_editor_tabs_hide_other_settings_and_cancel_the_entire_draft() {
     panel.rows.push(row);
     panel.cursor = 1;
     d.press(KeyCode::Char('e'));
-    assert!(d.render().contains("[1 Connection]"));
-    assert!(!d.render().contains("Codex connection") && !d.render().contains("Clipboard"));
+    let out = d.render();
+    for label in [
+        "Label",
+        "Target",
+        "Advanced SSH options",
+        "Icon",
+        "Codex connection",
+        "Clipboard",
+        "Git SSH agent",
+        "Work tab command",
+    ] {
+        assert!(
+            out.contains(label),
+            "{label} missing from the unified form: {out}"
+        );
+    }
+    assert!(
+        !out.contains("[1 Connection]")
+            && !out.contains("[2 Codex]")
+            && !out.contains("[3 Services]")
+    );
     d.press(KeyCode::Char('X'));
     d.app
         .handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
@@ -6410,7 +6532,10 @@ fn host_editor_tabs_hide_other_settings_and_cancel_the_entire_draft() {
         Some(HostField::CodexMode)
     );
     let out = d.render();
-    assert!(out.contains("[2 Codex]") && !out.contains("Target") && !out.contains("Clipboard"));
+    assert!(
+        out.contains("Codex connection") && out.contains("Target") && out.contains("Clipboard"),
+        "{out}"
+    );
     d.press(KeyCode::Char(' '));
     assert!(d.render().contains("Codex endpoint"));
     d.app
@@ -6421,7 +6546,8 @@ fn host_editor_tabs_hide_other_settings_and_cancel_the_entire_draft() {
     );
     let out = d.render();
     assert!(
-        out.contains("[3 Services]") && !out.contains("Codex endpoint") && !out.contains("Target")
+        out.contains("Clipboard") && out.contains("Codex endpoint") && out.contains("Target"),
+        "{out}"
     );
     d.press(KeyCode::Char(' '));
     d.press(KeyCode::Esc);
@@ -7216,14 +7342,22 @@ fn clipboard_policy_is_shown_in_host_details() {
     assert!(!d.render().contains("test-target"));
     d.press(KeyCode::Enter);
     let out = d.render();
-    assert!(out.contains("ssh test-target"), "{out}");
-    assert!(out.contains("Clipboard off"), "{out}");
+    assert!(out.contains("test-target"), "{out}");
+    assert!(
+        out.lines()
+            .any(|line| line.contains("Clipboard") && line.contains("Off")),
+        "{out}"
+    );
     d.app.host_edit.as_mut().unwrap().rows[1].clipboard = true;
-    assert!(d.render().contains("Clipboard on"));
+    assert!(
+        d.render()
+            .lines()
+            .any(|line| line.contains("Clipboard") && line.contains("On"))
+    );
 }
 
 /// The clipboard is a **field**, not a panel key: it shows its own state in the
-/// Services tab, `Space` flips it, and `Esc` puts it back like any other field.
+/// Services section, `Space` flips it, and `Esc` puts it back like any other field.
 ///
 /// The old `p` in the list was invisible until you read the footer and had no way
 /// to say what it currently was. Being a field, `[off]` is on screen the moment
@@ -7247,10 +7381,10 @@ fn the_clipboard_is_a_field_in_the_row_editor() {
     d.press(KeyCode::Char('p'));
     assert!(!row(&d), "`p` in the list must no longer toggle anything");
 
-    // The Services tab contains clipboard policy; Tab reaches it even when
+    // Clipboard policy is visible immediately; Tab reaches it even when
     // this host has no Codex settings to show.
     d.press(KeyCode::Char('e'));
-    assert!(!d.render().contains("Clipboard"));
+    assert!(d.render().contains("Clipboard"));
     for _ in 0..4 {
         d.press(KeyCode::Tab);
     }
@@ -7361,15 +7495,15 @@ fn the_hosts_row_editor_draws_as_a_card_over_the_list() {
     let hinted = d.render();
     assert!(hinted.contains("Space toggle"), "{hinted}");
     assert!(
-        !quiet.contains("Clipboard"),
-        "inactive tabs stay out of the form"
+        quiet.contains("Clipboard"),
+        "all sections share the same form"
     );
     d.press(KeyCode::Tab);
     let quiet_service = d.render();
     assert_eq!(
         row_of(&quiet_service, "Clipboard"),
         row_of(&hinted, "Clipboard"),
-        "a field hint must not move fields in the same tab"
+        "a field hint must not move fields in the form"
     );
 
     // A row the edit *created* says so, because there `Esc` drops it rather than
@@ -7426,11 +7560,11 @@ fn the_hosts_editor_wraps_a_value_too_long_for_its_card() {
     );
     assert!(
         out.contains("Icon"),
-        "the active section still closes: {out}"
+        "the next field follows the wrapped value: {out}"
     );
     assert!(
-        !out.contains("Clipboard"),
-        "inactive section stays hidden: {out}"
+        out.contains("Clipboard"),
+        "later settings stay visible in the same form: {out}"
     );
 }
 

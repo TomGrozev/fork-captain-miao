@@ -1246,11 +1246,13 @@ decides what they mean**.
     there. Titled `Edit Host`, or `Add Host` on a row the edit created, because
     those are the two different things `Esc` does. It used to be a pane pinned
     under the list, which took eight of the panel's rows the moment you pressed
-    `e` — and the panel has no scrolling, so on a full list the hosts at the
-    bottom (including, often, the one being edited) simply left the screen.
-    `Tab`/`S-Tab`, `↑`/`↓` and `^n`/`^p` all walk the five fields, forwards and
-    back — a ring you can only cycle one way makes overshooting a field cost
-    three more presses. The fields
+    `e` — so on a full list the hosts at the bottom (including, often, the one
+    being edited) simply left the screen. Connection, Codex and Services now
+    share one form, with all supported fields visible together when they fit.
+    `Tab`/`S-Tab`, `↑`/`↓` and `^n`/`^p` walk its fields in both directions;
+    `Alt+1/2/3` moves focus to a section without switching views. On a short
+    terminal the form scrolls to the focused field or text cursor, while its
+    contextual help stays pinned below the fields. The fields
     are `TextInput`s, the same widget behind every picker's query, so the
     readline keys, the arrows and Home/End work inside them and the cursor
     renders where it actually is. **`Enter` commits and `Esc` cancels**: the
@@ -1268,10 +1270,10 @@ decides what they mean**.
     `decide_provision` with the running daemon out of the picture, and only an
     `Upload` becomes an offer, so a host on a user's own PATH install (never
     overwritten) or already on our exact digest advertises nothing. The row
-    wears `↑<version>` where an offer exists and the footer hint appears with
-    it — a key that would silently do nothing is worse than no key, and every
-    other key here works on every row. A stale-but-unfixable host keeps the
-    plain `(older than ours)` annotation instead.
+    wears `↑` when its connected server is older than the dashboard; details
+    show the running version separately from an available update and its `u`
+    shortcut. Without an upgrade offer, details explain that the server is
+    older than the dashboard instead of advertising an unavailable action.
   - **Two refusals, and they are one rule seen twice.** The upgrade ends every
     session on the host and brings each one back as a window *here*, so it
     declines a host with any **non-idle** session and any session **another

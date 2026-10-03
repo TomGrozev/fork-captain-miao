@@ -252,7 +252,7 @@ pub(crate) struct HostRow {
     /// A form field, toggled with `Space`: the panel's plain letters are for
     /// things you do *to* a row (connect, delete, upgrade), and this is part of
     /// what a host **is**, like its options. Being a field also means it shows its
-    /// own state — `[off]` is visible in Services, where a list key was only
+    /// own state — `[off]` is visible in the form, where a list key was only
     /// discoverable from the footer.
     pub(in crate::app) clipboard: bool,
     pub(in crate::app) forward_agent: bool,
@@ -319,8 +319,8 @@ pub(crate) enum HostField {
 }
 
 impl HostField {
-    /// Form order. Tab walks all supported fields in section order, switching
-    /// tabs as needed; each tab renders only its own fields.
+    /// Form order. All supported fields share one scrolling form, grouped by
+    /// purpose; Tab walks them without changing views.
     const ORDER: [HostField; 10] = [
         HostField::Label,
         HostField::Target,
@@ -393,6 +393,37 @@ fn utilisation_style(percent: f32, ui: &config::UiColors) -> Style {
         Style::default().fg(ui.attention_fg).bold()
     } else {
         Style::default().dim()
+    }
+}
+
+/// Wrap values beneath their own column, preserving status colors and keeping
+/// long endpoints or error text readable without swallowing the next label.
+fn host_detail_field(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: Span<'static>,
+    width: usize,
+) {
+    let indent = if label.is_empty() {
+        0
+    } else {
+        16.min(width.saturating_sub(1))
+    };
+    let text = crate::backend::host_text_safe(&value.content);
+    let mut first = true;
+    for physical in text.split('\n') {
+        for range in wrap_ranges(physical, width.saturating_sub(indent)) {
+            let prefix = if first && indent > 0 {
+                format!("{:<indent$}", one_line(label, indent.saturating_sub(1)))
+            } else {
+                " ".repeat(indent)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().dim()),
+                Span::styled(physical[range].to_owned(), value.style),
+            ]));
+            first = false;
+        }
     }
 }
 
@@ -471,8 +502,8 @@ impl App {
     }
 
     fn hosts_popup(area: Rect) -> Rect {
-        let width = area.width.saturating_sub(2).min(104);
-        let height = area.height.saturating_sub(2).min(28);
+        let width = area.width.saturating_sub(2).min(135);
+        let height = area.height.saturating_sub(2).min(36);
         Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -765,158 +796,227 @@ impl App {
         };
         let popup = Self::hosts_popup(area);
         clear_overlay(frame, popup);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .padding(Padding::horizontal(2))
-            .title(format!(
-                " {} · details ",
-                one_line(row.label.text(), popup.width.saturating_sub(16) as usize)
-            ));
-        let inner = block.inner(popup);
-        frame.render_widget(block, popup);
-        let width = inner.width as usize;
         let cfg = config::get();
         let ui = &cfg.colors.ui;
-        let dim = Style::default().dim();
+        let title = Style::default().fg(ui.title_fg).bold();
+        let icon = if row.icon.text().trim().is_empty() {
+            self.host_icon(&row.host())
+        } else {
+            row.icon.text().trim().to_owned()
+        };
+        let mut block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(2))
+            .title(Span::styled(
+                format!(
+                    " {icon} {} · details ",
+                    one_line(row.label.text(), popup.width.saturating_sub(20) as usize)
+                ),
+                title,
+            ));
+        let inner = block.inner(popup);
+        let columns = inner.width >= 100;
+        let column_width = if columns {
+            (inner.width - 4) / 2
+        } else {
+            inner.width
+        } as usize;
         let backend = self.backend_for(&row.host()).filter(|_| !row.disabled);
         let connection = backend.map(|b| b.conn_state());
-        let mut lines = Vec::new();
-        let append = |lines: &mut Vec<Line>, text: String, style| {
-            let text = crate::backend::host_text_safe(&text);
-            for physical_line in text.split('\n') {
-                for range in wrap_ranges(physical_line, width) {
-                    lines.push(Line::from(Span::styled(
-                        physical_line[range].to_owned(),
-                        style,
-                    )));
-                }
-            }
-        };
         let (label, style) = match &connection {
-            _ if row.disabled => ("Suspended by you", dim),
-            Some(ConnState::Connected) => ("Connected", Style::default().fg(Color::Green)),
-            Some(ConnState::Connecting) => ("Connecting", dim),
-            Some(ConnState::Failed(_)) => ("Connection failed", Style::default().fg(ui.error_fg)),
-            _ => ("Not connected", dim),
+            _ if row.disabled => ("Suspended by you", Style::default()),
+            Some(ConnState::Connected) => ("Connected", Style::default().fg(Color::Green).bold()),
+            Some(ConnState::Connecting) => ("Connecting", Style::default()),
+            Some(ConnState::Failed(_)) => {
+                ("Connection failed", Style::default().fg(ui.error_fg).bold())
+            }
+            _ => ("Not connected", Style::default()),
         };
-        append(&mut lines, label.into(), style);
+        let mut lines = Vec::new();
+        host_detail_field(
+            &mut lines,
+            "Status",
+            Span::styled(label, style),
+            inner.width as usize,
+        );
         if let Some(state @ ConnState::Failed(_)) = &connection {
-            append(
+            host_detail_field(
                 &mut lines,
-                state.label().to_owned(),
-                Style::default().fg(ui.error_fg),
+                "Reason",
+                Span::styled(state.label().to_owned(), Style::default().fg(ui.error_fg)),
+                inner.width as usize,
             );
         }
         if connection.as_ref().is_some_and(ConnState::is_connected) {
             let (running, attached) = self.host_session_counts(&row.host());
-            append(
+            host_detail_field(
                 &mut lines,
-                format!(
-                    "{running} {} / {attached} attached",
-                    super::plural_sessions(running)
+                "Sessions",
+                Span::styled(
+                    format!("{running} running · {attached} attached"),
+                    Style::default().bold(),
                 ),
-                Style::default(),
+                inner.width as usize,
             );
         }
-        append(&mut lines, String::new(), dim);
-        append(&mut lines, "Connection".into(), dim);
-        append(
-            &mut lines,
+        lines.push(Line::default());
+
+        let heading = |label| vec![Line::from(Span::styled(label, title))];
+        let mut transport = heading("Connection");
+        let field = |lines: &mut Vec<Line<'static>>, label, value| {
+            host_detail_field(lines, label, Span::raw(value), column_width);
+        };
+        field(
+            &mut transport,
+            "Transport",
             if row.is_local {
-                "this machine".into()
+                "This machine"
+            } else if row.is_socket {
+                "Local socket"
             } else {
-                format!(
-                    "{} {}",
-                    if row.is_socket { "socket" } else { "ssh" },
-                    row.target.text()
-                )
-            },
-            Style::default(),
-        );
-        if !row.options.text().trim().is_empty() {
-            append(&mut lines, row.options.text().to_owned(), dim);
-        }
-        if let Some(backend) = backend {
-            if let Some(version) = backend.daemon_version() {
-                let mut server = format!("Server v{version}");
-                match backend.upgrade_offer() {
-                    Some(offer) => server.push_str(&format!(" → v{} (u upgrade)", offer.version)),
-                    None if super::format::version_is_older(
-                        &version,
-                        env!("CARGO_PKG_VERSION"),
-                    ) =>
-                    {
-                        server.push_str(" (older than ours)")
-                    }
-                    None => {}
-                }
-                append(&mut lines, server, dim);
+                "SSH"
             }
-            append(&mut lines, String::new(), dim);
-            append(&mut lines, "Resources".into(), dim);
-            let values = self.host_list_values(row, false);
-            lines.push(Line::from(vec![
-                Span::styled("CPU ", dim),
-                values[2].clone(),
-                Span::styled("   Mem ", dim),
-                values[3].clone(),
-                Span::styled("   Disk ", dim),
-                values[4].clone(),
-            ]));
-            append(&mut lines, format!("Latency {}", values[5].content), dim);
+            .to_owned(),
+        );
+        if !row.is_local {
+            field(&mut transport, "Target", row.target.text().to_owned());
         }
-        append(&mut lines, String::new(), dim);
-        append(&mut lines, "Codex".into(), dim);
-        append(
-            &mut lines,
+        if !row.options.text().trim().is_empty() {
+            field(&mut transport, "SSH options", row.options.text().to_owned());
+        }
+        if let Some(backend) = backend
+            && let Some(version) = backend.daemon_version()
+        {
+            field(&mut transport, "Server", format!("v{version}"));
+            let update = match backend.upgrade_offer() {
+                Some(offer) => Some(format!("v{} available · u to upgrade", offer.version)),
+                None if super::format::version_is_older(&version, env!("CARGO_PKG_VERSION")) => {
+                    Some(format!(
+                        "Older than dashboard v{}",
+                        env!("CARGO_PKG_VERSION")
+                    ))
+                }
+                None => None,
+            };
+            if let Some(update) = update {
+                host_detail_field(
+                    &mut transport,
+                    "Update",
+                    Span::styled(update, Style::default().fg(ui.attention_fg)),
+                    column_width,
+                );
+            }
+        }
+        let mut resources = Vec::new();
+        if backend.is_some() {
+            resources = heading("Resources");
+            let values = self.host_list_values(row, false);
+            for (label, value) in ["CPU", "Memory", "Disk", "Latency"]
+                .into_iter()
+                .zip(&values[2..])
+            {
+                let mut value = value.clone();
+                value.style = value.style.remove_modifier(Modifier::DIM).bold();
+                host_detail_field(&mut resources, label, value, column_width);
+            }
+        }
+        let mut codex = heading("Codex");
+        field(
+            &mut codex,
+            "Mode",
             row.codex
                 .as_ref()
                 .map(|c| c.mode.label().to_owned())
                 .unwrap_or_else(|| "Unavailable".into()),
-            Style::default(),
         );
         if HostField::CodexEndpoint.visible_for(row) {
-            append(&mut lines, row.codex_endpoint.text().to_owned(), dim);
+            field(
+                &mut codex,
+                "Endpoint",
+                match row.codex_endpoint.text().trim() {
+                    "" | "unix://" => "Default Unix socket".into(),
+                    endpoint => endpoint.to_owned(),
+                },
+            );
         }
         if let Some(error) = &row.codex_error {
-            append(
-                &mut lines,
-                error.clone(),
-                Style::default().fg(ui.attention_fg),
+            host_detail_field(
+                &mut codex,
+                "Status",
+                Span::styled(error.clone(), Style::default().fg(ui.attention_fg)),
+                column_width,
             );
         }
+        let mut services = Vec::new();
         if !row.is_local {
-            append(&mut lines, String::new(), dim);
-            append(&mut lines, "Services".into(), dim);
-            append(
-                &mut lines,
-                format!(
-                    "Clipboard {} / {} enabled port forwards",
-                    if row.clipboard { "on" } else { "off" },
-                    row.forwards.iter().filter(|f| !f.disabled).count()
-                ),
-                Style::default(),
+            services = heading("Services");
+            field(
+                &mut services,
+                "Clipboard",
+                if row.clipboard { "On" } else { "Off" }.into(),
             );
             if !row.is_socket {
-                append(
-                    &mut lines,
-                    format!(
-                        "Git SSH agent {}",
-                        if row.forward_agent { "on" } else { "off" }
-                    ),
-                    Style::default(),
+                field(
+                    &mut services,
+                    "Git SSH agent",
+                    if row.forward_agent { "On" } else { "Off" }.into(),
+                );
+                field(
+                    &mut services,
+                    "Port forwards",
+                    if row.forwards.is_empty() {
+                        "None configured".into()
+                    } else {
+                        format!(
+                            "{} enabled / {} total",
+                            row.forwards.iter().filter(|f| !f.disabled).count(),
+                            row.forwards.len()
+                        )
+                    },
+                );
+                field(
+                    &mut services,
+                    "Work tabs",
+                    if row.shell_command.text().trim().is_empty() {
+                        "Default shell".into()
+                    } else {
+                        row.shell_command.text().to_owned()
+                    },
                 );
             }
-            if !row.shell_command.text().trim().is_empty() {
-                append(&mut lines, row.shell_command.text().to_owned(), dim);
+        }
+        if columns {
+            for (left, right) in [(transport, codex), (resources, services)] {
+                let mut left = left.into_iter();
+                let mut right = right.into_iter();
+                loop {
+                    let (a, b) = (left.next(), right.next());
+                    if a.is_none() && b.is_none() {
+                        break;
+                    }
+                    let mut line = a.unwrap_or_default();
+                    line.spans.push(Span::raw(
+                        " ".repeat((column_width + 4).saturating_sub(line.width())),
+                    ));
+                    line.spans.extend(b.unwrap_or_default().spans);
+                    lines.push(line);
+                }
+                lines.push(Line::default());
+            }
+        } else {
+            for section in [transport, resources, codex, services] {
+                if !section.is_empty() {
+                    lines.extend(section);
+                    lines.push(Line::default());
+                }
             }
         }
         if let Some(message) = &state.message {
-            append(&mut lines, String::new(), dim);
-            append(
+            host_detail_field(
                 &mut lines,
-                message.clone(),
-                Style::default().fg(ui.attention_fg),
+                "",
+                Span::styled(message.clone(), Style::default().fg(ui.attention_fg)),
+                inner.width as usize,
             );
         }
         let rows = inner.height as usize;
@@ -925,6 +1025,10 @@ impl App {
         } else {
             state.detail_scroll.min(lines.len().saturating_sub(rows))
         };
+        if lines.len() > rows {
+            block = block.title_bottom(Line::from(" ↑/↓ scroll ").right_aligned());
+        }
+        frame.render_widget(block, popup);
         frame.render_widget(
             Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
             inner,
@@ -1046,7 +1150,7 @@ impl App {
             && let Some(r) = state.rows.get(state.cursor)
         {
             let host_popup = Self::hosts_popup(area);
-            // Keep every tab the same width, inset two cells per side from
+            // Keep the form inset two cells per side from
             // the parent panel. Long values wrap within that fixed cell grid.
             let width = host_popup.width.saturating_sub(4);
             // What a field's text has to fit in: the card's inner width — the
@@ -1055,7 +1159,7 @@ impl App {
             // cursor, which needs somewhere to sit on an otherwise full line.
             let label_w = HostField::ORDER
                 .iter()
-                .filter(|field| field.visible_for(r) && field.section() == focus.section())
+                .filter(|field| field.visible_for(r))
                 .map(|field| field.label().len())
                 .max()
                 .unwrap_or(0)
@@ -1082,49 +1186,41 @@ impl App {
                                 // Reserve a gap after the widest visible label.
                                 Span::styled(
                                     format!("{label:<label_w$}"),
-                                    Style::default().add_modifier(Modifier::DIM),
+                                    if focused {
+                                        Style::default().fg(config::get().colors.ui.title_fg).bold()
+                                    } else {
+                                        Style::default().dim()
+                                    },
                                 ),
                             ]
                         } else {
                             vec![Span::raw(" ".repeat(value_col))]
                         };
                         spans.extend(value);
-                        Line::from(spans)
+                        Line::from(spans).style(if focused {
+                            Style::default().bg(config::get().colors.ui.highlight_bg)
+                        } else {
+                            Style::default()
+                        })
                     })
                     .collect::<Vec<_>>()
             };
-            let tabs = Line::from(
-                HostSection::ALL
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, section)| {
-                        let visible = HostField::ORDER
-                            .iter()
-                            .any(|f| f.section() == section && f.visible_for(r))
-                            || (r.is_local && section == HostSection::Codex);
-                        visible.then(|| {
-                            let active = section == focus.section();
-                            Span::styled(
-                                if active {
-                                    format!("[{} {}]  ", i + 1, section.label())
-                                } else {
-                                    format!(" {} {}   ", i + 1, section.label())
-                                },
-                                if active {
-                                    Style::default().fg(config::get().colors.ui.title_fg)
-                                } else {
-                                    Style::default().dim()
-                                },
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            );
             let mut form_lines = Vec::new();
+            let mut section = None;
             for field in HostField::ORDER
                 .into_iter()
-                .filter(|field| field.section() == focus.section() && field.visible_for(r))
+                .filter(|field| field.visible_for(r))
             {
+                if section != Some(field.section()) {
+                    if section.is_some() {
+                        form_lines.push(Line::default());
+                    }
+                    form_lines.push(Line::from(Span::styled(
+                        field.section().label(),
+                        Style::default().fg(config::get().colors.ui.title_fg).bold(),
+                    )));
+                    section = Some(field.section());
+                }
                 let focused = focus == field;
                 let values = match field {
                     HostField::Label => text_field_lines(&r.label, focused, value_w),
@@ -1168,11 +1264,17 @@ impl App {
                     HostField::CodexEndpoint => {
                         text_field_lines(&r.codex_endpoint, focused, value_w)
                     }
-                    HostField::Forwards => vec![vec![Span::raw(format!(
-                        "{} enabled · {} total  [manage]",
-                        r.forwards.iter().filter(|f| !f.disabled).count(),
-                        r.forwards.len()
-                    ))]],
+                    HostField::Forwards => {
+                        let summary = format!(
+                            "{} enabled · {} total  [manage]",
+                            r.forwards.iter().filter(|f| !f.disabled).count(),
+                            r.forwards.len()
+                        );
+                        wrap_ranges(&summary, value_w)
+                            .into_iter()
+                            .map(|range| vec![Span::raw(summary[range].to_owned())])
+                            .collect()
+                    }
                     HostField::ShellCommand => {
                         let mut lines = text_field_lines(&r.shell_command, focused, value_w);
                         if r.shell_command.text().trim().is_empty()
@@ -1192,12 +1294,9 @@ impl App {
                         .unwrap_or_else(|| "Loading Codex settings…".into()),
                 ));
             }
-            // The field rows — one per field until a value wraps — a blank, the
-            // hint line (held whether this field has a hint or not, for the same
-            // reason the width is), and the two borders. The card grows down as a
-            // value wraps rather than the value being cut off at the frame: this
-            // is text being *edited*, and what you cannot see you cannot tell you
-            // typed twice.
+            // Reserve both borders, top padding, a gap and two pinned help rows.
+            // Long values grow the card up to the panel height, then scroll with
+            // the text cursor so the part being edited always stays visible.
             let height = (form_lines.len() as u16 + 6).min(host_popup.height);
             // A terminal too small to draw a frame around anything. The dashboard
             // as a whole is unusable well before this, so it is a guard against a
@@ -1235,25 +1334,33 @@ impl App {
                 .title(Span::styled(title, Style::default().bold()));
             let inner = block.inner(popup);
             frame.render_widget(block, popup);
-            frame.render_widget(
-                Paragraph::new(tabs),
-                Rect::new(inner.x, inner.y, inner.width, 1),
-            );
             let fields_area = Rect::new(
                 inner.x,
-                inner.y + 2,
+                inner.y + 1,
                 inner.width,
-                inner.height.saturating_sub(2),
+                inner.height.saturating_sub(4),
             );
-
-            // The blank goes in whether or not this field has a hint, so the one
-            // line the card reserves for it doesn't shunt the fields up and down.
-            form_lines.push(Line::from(""));
+            // Keep contextual help outside the scrolled fields, including when
+            // a long value fills the form or the terminal is resized.
             if let Some(hint) = state.message.as_deref().or_else(|| host_field_hint(focus)) {
-                form_lines.push(Line::from(Span::styled(
-                    hint,
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
+                let hint = crate::backend::host_text_safe(hint);
+                let hints: Vec<_> = wrap_ranges(&hint, inner.width as usize)
+                    .into_iter()
+                    .map(|range| Line::from(hint[range].to_owned()))
+                    .collect();
+                frame.render_widget(
+                    Paragraph::new(hints).style(if state.message.is_some() {
+                        Style::default().fg(config::get().colors.ui.attention_fg)
+                    } else {
+                        Style::default().dim()
+                    }),
+                    Rect::new(
+                        inner.x,
+                        inner.bottom().saturating_sub(2),
+                        inner.width,
+                        2.min(inner.height),
+                    ),
+                );
             }
             let focus_line = form_lines
                 .iter()
@@ -1270,7 +1377,9 @@ impl App {
                     })
                 })
                 .unwrap_or(0);
-            let scroll = focus_line.saturating_sub(fields_area.height.saturating_sub(2) as usize);
+            let scroll = focus_line
+                .saturating_sub(fields_area.height.saturating_sub(2) as usize)
+                .min(form_lines.len().saturating_sub(fields_area.height as usize));
             frame.render_widget(
                 Paragraph::new(form_lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
                 fields_area,
@@ -1311,7 +1420,7 @@ impl App {
                     } else {
                         "Alt+1/3"
                     },
-                    "tab",
+                    "section",
                 ));
             }
             pairs.extend([
@@ -1861,7 +1970,7 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         HostField::CodexEndpoint => Some("  Unix socket; unix:// uses the default"),
         HostField::Target => Some("  ^t toggle ssh / socket"),
         // Point port setup toward the dedicated manager beside this field.
-        HostField::Options => Some("  Quoted SSH arguments; tunnels in Services"),
+        HostField::Options => Some("  Quoted SSH arguments; use Port forwards for tunnels"),
         HostField::ShellCommand => Some("  Runs in work tabs; empty = default shell"),
         HostField::Forwards => Some("  Enter manage; apply host edits first"),
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
