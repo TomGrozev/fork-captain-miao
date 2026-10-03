@@ -82,6 +82,7 @@ lzma-rs = "0.3"
 # the deploy marker records. Already in the tree via `cm-core` and `xtask`, and
 # pinned to the same major, so this adds no compile.
 sha2 = "0.11"
+tempfile = "3"
 
 [features]
 default = ["remote"]

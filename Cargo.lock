@@ -263,6 +263,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "shell-words",
+ "tempfile",
  "tiny-skia",
  "tokio",
  "toml",

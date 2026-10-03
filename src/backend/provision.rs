@@ -30,7 +30,9 @@
 //! `attach_plan`, `shell_plan` — it is `anyhow::Result` like everywhere else.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
@@ -1389,6 +1391,9 @@ async fn ask_consent(question: String) -> bool {
     )
 }
 
+type DownloadLocks = HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>;
+static DOWNLOADS: LazyLock<Mutex<DownloadLocks>> = LazyLock::new(Mutex::default);
+
 /// Fetch a published server into the XDG cache, and return where it landed.
 ///
 /// Two guards travel with the download, both mirroring `xtask`'s copy and both
@@ -1401,27 +1406,47 @@ async fn ask_consent(question: String) -> bool {
 ///   to land on, and the result is rejected unless it is a regular file: `tar`
 ///   will happily extract an entry recorded as a symlink, and reading through
 ///   one would pull in a file from outside the staging directory.
-async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, String> {
+async fn download_server(target: &str, url: &str) -> Result<PathBuf, String> {
     let dest = crate::server_payload::cache_path_for(target)
         .ok_or_else(|| "no cache directory available".to_string())?;
-    let dir = dest
-        .parent()
-        .ok_or_else(|| "bad cache path".to_string())?
-        .to_path_buf();
-    // A fresh directory per fetch: `tar` extracts over whatever is there, so a
-    // failed download followed by an extract of a *previous* archive would
-    // silently install a stale binary.
-    // std, not tokio::fs: these are metadata-sized local operations, and the
-    // dashboard's tokio deliberately does not enable the `fs` feature.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let tgz = dir.join("server.tar.gz");
+    download_server_to(&dest, url, std::ffi::OsStr::new("curl")).await
+}
+
+async fn download_server_to(
+    dest: &Path,
+    url: &str,
+    curl: &std::ffi::OsStr,
+) -> Result<PathBuf, String> {
+    let lock = DOWNLOADS
+        .lock()
+        .unwrap()
+        .entry(dest.to_path_buf())
+        .or_default()
+        .clone();
+    let _download = lock.lock().await;
+    // Another host may have completed this same version/target while we waited.
+    if std::fs::symlink_metadata(dest)
+        .is_ok_and(|m| m.is_file() && m.len() > 0 && m.len() <= MAX_SERVER_BYTES)
+    {
+        return Ok(dest.to_path_buf());
+    }
+    let dir = dest.parent().ok_or_else(|| "bad cache path".to_string())?;
+    crate::state::create_dir_all_private(dir)
+        .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    // Every attempt owns its archive/extraction directory. Publish only the
+    // checked binary, so another task/process never sees a partial cache entry.
+    let stage = tempfile::Builder::new()
+        .prefix(".download-")
+        .tempdir_in(dir)
+        .map_err(|e| format!("creating download staging directory: {e}"))?;
+    let tgz = stage.path().join("server.tar.gz");
+    let binary = stage.path().join(SERVER_BIN);
 
     // Both bounds are curl's own as well as ours: `--max-time` is what actually
     // stops a server that accepts the connection and then dribbles (a stall no
     // connect timeout covers), and it gets to produce the error message, so the
     // outer timeout below is only the backstop for a curl that ignores it.
-    let child = Command::new("curl")
+    let child = Command::new(curl)
         .args([
             "--fail",
             "--silent",
@@ -1464,7 +1489,7 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
         .arg("-xzf")
         .arg(&tgz)
         .arg("-C")
-        .arg(&dir)
+        .arg(stage.path())
         .args(["--no-same-owner", "--no-same-permissions", SERVER_BIN])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1485,10 +1510,10 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
     }
     let _ = std::fs::remove_file(&tgz);
 
-    let meta = std::fs::symlink_metadata(&dest)
+    let meta = std::fs::symlink_metadata(&binary)
         .map_err(|e| format!("{url} did not yield {SERVER_BIN}: {e}"))?;
     if !meta.is_file() {
-        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&binary);
         return Err(format!(
             "{url} did not yield a regular file at {SERVER_BIN}"
         ));
@@ -1499,7 +1524,7 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
     // so the cost of a bomb is bounded by the extract timeout, and this is what
     // stops the result being *used*.
     if meta.len() > MAX_SERVER_BYTES {
-        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(&binary);
         return Err(format!(
             "{url} yielded a {}MB {SERVER_BIN}, which is not a server binary",
             meta.len() / 1_000_000
@@ -1508,9 +1533,10 @@ async fn download_server(target: &str, url: &str) -> Result<std::path::PathBuf, 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755));
     }
-    Ok(dest)
+    std::fs::rename(&binary, dest).map_err(|e| format!("publishing downloaded server: {e}"))?;
+    Ok(dest.to_path_buf())
 }
 
 /// Source (5): ask, fetch, and cache a published server for the first target we
@@ -1879,6 +1905,81 @@ pub(super) struct Provisioned {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_downloads_share_one_complete_atomic_cache_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::Builder::new()
+            .prefix("cm-download-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join(SERVER_BIN), "fixture server payload").unwrap();
+        let archive = root.path().join("fixture.tar.gz");
+        assert!(
+            std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&source)
+                .arg(SERVER_BIN)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let curl = root.path().join("curl");
+        let quote = |path: &Path| shell_words::quote(path.to_str().unwrap()).into_owned();
+        let release = root.path().join("release");
+        let started = root.path().join("started");
+        let calls = root.path().join("calls");
+        std::fs::write(&curl, format!(
+            "#!/bin/sh\nset -e\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output ]; then shift; output=$1; fi\n  shift\ndone\necho call >> {}\necho partial > \"$output\"\necho started > {}\nwhile [ ! -e {} ]; do sleep 0.01; done\ncp {} \"$output\"\n",
+            quote(&calls), quote(&started), quote(&release), quote(&archive),
+        )).unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dest = root.path().join("cache").join(SERVER_BIN);
+        let fetch = || {
+            let dest = dest.clone();
+            let curl = curl.clone();
+            tokio::spawn(async move {
+                download_server_to(
+                    &dest,
+                    "https://example.invalid/server.tar.gz",
+                    curl.as_os_str(),
+                )
+                .await
+            })
+        };
+        let first = fetch();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = fetch();
+        tokio::task::yield_now().await;
+        assert!(
+            !dest.exists(),
+            "an in-progress binary became visible in the cache"
+        );
+        std::fs::write(&release, "").unwrap();
+        let (first, second) = tokio::join!(first, second);
+        assert_eq!(first.unwrap().unwrap(), dest);
+        assert_eq!(second.unwrap().unwrap(), dest);
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "fixture server payload"
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+            1,
+            "staging files survived a completed download"
+        );
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
