@@ -530,14 +530,27 @@ reconnect, `f` for port forwards, and `u` to upgrade the server when available.
   `hosts.json`. Only enable it for hosts you trust: the remote account or root
   can request authentication through your agent while the Git request runs.
 - **Work tab command** — edit an SSH host with `Space h` → `e` and set this
-  optional field to `tmux`, `zellij`, or a command with arguments. Pressing `w`
-  on one of that host's sessions opens a work tab in its directory and runs the
-  command in the remote user's interactive login environment. Missing, empty,
-  or whitespace-only `shell_command` opens the default user login shell.
-  When a command finishes, including on failure, the tab opens that shell;
-  errors stay visible. Pressing `w` on an existing work tab just focuses it.
-  Changes apply to new tabs without reconnecting the host. The setting lives
-  per host in `hosts.json` on the dashboard machine.
+  optional field to a shell command. Pressing `w` on one of that host's sessions
+  opens a work tab in its directory and runs the command in the remote user's
+  interactive login environment. The command receives `$MIAO_WORKDIR`, the
+  absolute directory on that host, and `$MIAO_WORKSPACE`, a stable name such as
+  `miao-project-9d2bf386d45fe429`. Both are set before shell startup scripts run.
+  The name combines a short, sanitized basename with a hash of the full
+  host-canonical directory. It survives dashboard restarts and host renames;
+  directories with the same basename and separate worktrees get distinct names.
+  For a persistent Zellij workspace, use:
+
+  ```sh
+  zellij attach --create "$MIAO_WORKSPACE" options --default-cwd "$MIAO_WORKDIR"
+  ```
+
+  A successful command exit (including Zellij detach) closes the work tab, so
+  pressing `w` again opens a new tab and reattaches to the same workspace.
+  On failure, a login shell opens so errors stay visible. Missing, empty, or
+  whitespace-only `shell_command` opens the default user login shell. Pressing
+  `w` on an existing work tab just focuses it. Changes apply to new tabs without
+  reconnecting the host. The setting lives per host in `hosts.json` on the
+  dashboard machine.
 - **Terminfo** — a host with no entry for your `TERM` is offered yours, so
   sessions there stop falling back to `xterm-256color`. It asks first.
 - **The daemon** is either your own on `PATH` or one the dashboard deploys.

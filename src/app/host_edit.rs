@@ -1971,7 +1971,9 @@ fn host_field_hint(field: HostField) -> Option<&'static str> {
         HostField::Target => Some("  ^t toggle ssh / socket"),
         // Point port setup toward the dedicated manager beside this field.
         HostField::Options => Some("  Quoted SSH arguments; use Port forwards for tunnels"),
-        HostField::ShellCommand => Some("  Runs in work tabs; empty = default shell"),
+        HostField::ShellCommand => {
+            Some("  empty = default shell · $MIAO_WORKDIR · $MIAO_WORKSPACE")
+        }
         HostField::Forwards => Some("  Enter manage; apply host edits first"),
         HostField::Icon => Some("  ^e pick emoji   empty = auto"),
         // Name whose clipboard is offered, as well as the toggle key.

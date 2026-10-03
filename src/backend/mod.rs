@@ -1291,7 +1291,7 @@ impl Backend {
 
     /// How to open an interactive login shell on this host in `cwd` (the `w`
     /// work tab): in process for this machine, over ssh for a remote. An SSH
-    /// host may run a configured command first, in an interactive login shell.
+    /// host may run a configured command in an interactive login shell instead.
     pub(crate) fn shell_plan(
         &self,
         cwd: &str,
@@ -2419,8 +2419,10 @@ fn resolve_local_attach_exe<'a>(
 /// empty `cwd` just drops the `cd`. Pure + unit-tested.
 ///
 /// A configured command rides separately as $1 and runs in an interactive
-/// login shell, so PATH and interactive shell setup are available. Afterwards
-/// the ordinary shell opens, even on failure, keeping diagnostics visible.
+/// login shell, so PATH and interactive shell setup are available. Export its
+/// workdir and stable workspace name ($2) before shell startup can change cwd.
+/// Success closes the tab so a later `w` can reattach a persistent workspace;
+/// failure opens the ordinary shell to keep diagnostics visible.
 fn remote_shell_argv(
     target: &str,
     options: &[String],
@@ -2430,10 +2432,11 @@ fn remote_shell_argv(
     let shell_command = shell_command.filter(|command| !command.trim().is_empty());
     let remote_cmd = if let Some(command) = shell_command {
         let script = concat!(
+            "export MIAO_WORKDIR=\"$PWD\" MIAO_WORKSPACE=\"$2\"; ",
             "\"${SHELL:-/bin/sh}\" -l -i -c \"$1\"; ",
             "status=$?; ",
-            "if [ \"$status\" -ne 0 ]; then ",
-            "echo \"Work tab command exited with status $status\" >&2; fi; ",
+            "if [ \"$status\" -eq 0 ]; then exit 0; fi; ",
+            "echo \"Work tab command exited with status $status\" >&2; ",
             "exec \"${SHELL:-/bin/sh}\" -l"
         );
         let script = if cwd.is_empty() {
@@ -2442,10 +2445,11 @@ fn remote_shell_argv(
             format!("cd \"$0\" || exit; {script}")
         };
         format!(
-            "{} {} {}",
+            "{} {} {} {}",
             login_shell_safe(&script),
             cm_core::paths::shell_quote_host_path(cwd),
-            login_shell_quote_arg(command)
+            login_shell_quote_arg(command),
+            login_shell_quote_arg(&work_tab_workspace_name(cwd))
         )
     } else if cwd.is_empty() {
         login_shell_safe("exec \"${SHELL:-/bin/sh}\" -l")
@@ -2461,6 +2465,31 @@ fn remote_shell_argv(
     argv.push(target.to_string());
     argv.push(remote_cmd);
     argv
+}
+
+/// Persistent workspace identity within the remote account. Hash the full
+/// host-canonical cwd, keeping a short readable basename. SSH aliases, host
+/// labels and dashboard restarts must not change which workspace is attached.
+/// Keep this spelling stable: changing it strands existing named sessions.
+fn work_tab_workspace_name(cwd: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let label: String = Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("work")
+        .chars()
+        .take(24)
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let label = label.trim_matches('-');
+    let label = if label.is_empty() { "work" } else { label };
+    let digest: String = Sha256::digest(cwd)
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("miao-{label}-{digest}")
 }
 
 /// Quote command text for the account's login shell without expanding it.
@@ -4263,7 +4292,28 @@ mod tests {
     }
 
     #[test]
-    fn remote_shell_command_runs_in_cwd_and_returns_to_the_default_shell() {
+    fn work_tab_workspace_names_are_stable_and_safe_for_multiplexers() {
+        // Pin the spelling across releases: these names may already belong to
+        // live sessions, including multiple directories with one basename.
+        assert_eq!(
+            work_tab_workspace_name("~/one/project"),
+            "miao-project-9d2bf386d45fe429"
+        );
+        assert_eq!(
+            work_tab_workspace_name("~/two/project"),
+            "miao-project-5dbafdd639f9ad8b"
+        );
+        let long = format!("~/{}", "project".repeat(50));
+        for cwd in ["", "/", "~", "~/🐈", "~/it's a $project:one.two", &long] {
+            let name = work_tab_workspace_name(cwd);
+            assert!(name.starts_with("miao-"));
+            assert!(name.len() <= 64, "unbounded workspace name: {name}");
+            assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+        }
+    }
+
+    #[test]
+    fn remote_shell_command_closes_on_success_and_preserves_errors() {
         let root = std::env::temp_dir().join(format!("cm-work-shell-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         // Shells resolve symlinked temporary directories, including macOS's
@@ -4289,11 +4339,18 @@ fi
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
         // Shell expressions must reach the inner shell verbatim, and expand
         // only there. Include quotes, consecutive backslashes and Unicode.
-        let command = r#"printf '%s\n' "$PWD" "$MIAO_LOGIN_READY" 'it'\''s \\ $literal `literal` 🐈'; exit 7"#;
+        let command =
+            r#"printf '%s\n' "$PWD" "$MIAO_LOGIN_READY" 'it'\''s \\ $literal `literal` 🐈'"#;
         let mut checked = 0;
         for outer in ["/bin/sh", "bash", "zsh", "dash", "ksh", "fish"] {
-            for cwd in ["~/project with spaces", ""] {
-                let cmd = remote_shell_argv("box", &[], cwd, Some(command))
+            for (cwd, status) in [
+                ("~/project with spaces", 0),
+                ("~/project with spaces", 7),
+                ("", 0),
+                ("", 7),
+            ] {
+                let command = format!("{command}; exit {status}");
+                let cmd = remote_shell_argv("box", &[], cwd, Some(&command))
                     .pop()
                     .unwrap();
                 let out = match std::process::Command::new(outer)
@@ -4313,19 +4370,24 @@ fi
                     "{outer}: {}",
                     String::from_utf8_lossy(&out.stderr)
                 );
+                let fallback = if status == 0 {
+                    String::new()
+                } else {
+                    format!("default:{}\n", expected_cwd.display())
+                };
                 assert_eq!(
                     String::from_utf8_lossy(&out.stdout),
                     format!(
-                        "{}\nready\nit's \\\\ $literal `literal` 🐈\ndefault:{}\n",
+                        "{}\nready\nit's \\\\ $literal `literal` 🐈\n{fallback}",
                         expected_cwd.display(),
-                        expected_cwd.display()
                     ),
-                    "{outer} lost the command or cwd"
+                    "{outer} lost the command, cwd, or exit behavior (status {status})"
                 );
-                assert!(
+                assert_eq!(
                     String::from_utf8_lossy(&out.stderr)
                         .contains("Work tab command exited with status 7"),
-                    "{outer} hid the command failure"
+                    status != 0,
+                    "{outer} misreported the command status"
                 );
                 checked += 1;
             }
@@ -4344,6 +4406,90 @@ fi
             .unwrap();
         assert!(!out.status.success());
         assert!(out.stdout.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_shell_command_exports_workspace_context_before_shell_startup() {
+        let root = std::env::temp_dir().join(format!("cm-work-context-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let shell = root.join("login-shell");
+        std::fs::write(
+            &shell,
+            r#"#!/bin/sh
+if [ "$#" -eq 1 ] && [ "$1" = "-l" ]; then
+    echo default-shell
+elif [ "$#" -eq 4 ] && [ "$1" = "-l" ] && [ "$2" = "-i" ] && [ "$3" = "-c" ]; then
+    # Model shell startup changing directories before the configured command.
+    cd "$HOME" || exit
+    /bin/sh -c "$4"
+else
+    exit 99
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = r#"printf '%s\0' "$MIAO_WORKSPACE" "$MIAO_WORKDIR" "$PWD""#;
+        let mut workspaces = HashMap::new();
+        for cwd in ["~/one/project", "~/two/project", "~/it's a $project 🐈", ""] {
+            let dir = cm_core::paths::expand_home(cwd, root.to_str().unwrap());
+            let dir = if cwd.is_empty() {
+                root.to_str().unwrap()
+            } else {
+                &dir
+            };
+            std::fs::create_dir_all(dir).unwrap();
+            for outer in ["/bin/sh", "bash", "zsh", "dash", "ksh", "fish"] {
+                // SSH aliases and subsequent invocations must select the same
+                // workspace. Neither the transport nor the dashboard owns it.
+                for target in ["box", "box-alias"] {
+                    let cmd = remote_shell_argv(target, &[], cwd, Some(command))
+                        .pop()
+                        .unwrap();
+                    let out = match std::process::Command::new(outer)
+                        .args(["-c", &cmd])
+                        .env("SHELL", &shell)
+                        .env("HOME", &root)
+                        .env("MIAO_WORKDIR", "inherited-workdir")
+                        .env("MIAO_WORKSPACE", "inherited-workspace")
+                        .current_dir(&root)
+                        .output()
+                    {
+                        Ok(out) => out,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(e) => panic!("starting {outer}: {e}"),
+                    };
+                    assert!(
+                        out.status.success(),
+                        "{outer}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let stdout = String::from_utf8(out.stdout).unwrap();
+                    let fields: Vec<_> = stdout.split('\0').collect();
+                    assert_eq!(fields.len(), 4, "{outer}: {stdout:?}");
+                    let workspace = fields[0];
+                    assert!(
+                        workspace.starts_with("miao-"),
+                        "missing workspace: {stdout:?}"
+                    );
+                    assert!(workspace.len() <= 64);
+                    assert!(
+                        workspace
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    );
+                    assert_eq!(fields[1], dir, "{outer} lost the selected workdir");
+                    assert_eq!(fields[2], root.to_str().unwrap());
+                    assert_eq!(fields[3], "", "successful command opened a fallback shell");
+                    if let Some(previous) = workspaces.insert(cwd, workspace.to_owned()) {
+                        assert_eq!(workspace, previous, "workspace changed on reopening");
+                    }
+                }
+            }
+        }
+        assert_ne!(workspaces["~/one/project"], workspaces["~/two/project"]);
         std::fs::remove_dir_all(root).unwrap();
     }
 

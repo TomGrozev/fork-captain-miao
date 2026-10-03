@@ -49,8 +49,9 @@ pub(super) struct HostConfig {
     /// load; only connection options belong here.
     #[serde(default)]
     pub options: Vec<String>,
-    /// Command run in a new SSH work tab (`w`), before the default login shell.
-    /// Missing or blank keeps the ordinary shell. This is a dashboard setting,
+    /// Command run in a new SSH work tab (`w`) with MIAO_WORKDIR and
+    /// MIAO_WORKSPACE. Success closes the tab; failure opens a login shell.
+    /// Missing or blank keeps the ordinary shell. This dashboard setting is
     /// independent of the daemon connection and pooled agent sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_command: Option<String>,
