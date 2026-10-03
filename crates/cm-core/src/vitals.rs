@@ -121,30 +121,8 @@ impl VitalsSampler {
     /// no usable earlier reading to difference against — the first call, and
     /// any call more than [`MAX_CPU_WINDOW`] after the last one.
     pub fn sample(&mut self) -> HostVitals {
-        self.sample_at(Instant::now())
-    }
-
-    /// Whether a *usable* previous reading is now held — i.e. whether sampling
-    /// again shortly would produce a CPU figure. What tells an on-demand caller
-    /// apart from a host with no CPU counters at all, where waiting to re-sample
-    /// would buy nothing.
-    pub fn has_reading(&self) -> bool {
-        self.prev.is_some()
-    }
-
-    /// The clock-injected body of [`sample`], so the window rule is testable
-    /// without sleeping.
-    ///
-    /// [`sample`]: VitalsSampler::sample
-    fn sample_at(&mut self, now: Instant) -> HostVitals {
-        let ticks = read_cpu_ticks();
-        let cpu_percent = ticks.and_then(|cur| cpu_since(self.prev, cur, now));
-        // Keep the last *successful* reading: a transient failure should cost
-        // one sample, not restart the whole differencing. A stale one is
-        // replaced here too, which is what makes the very next sample usable.
-        if let Some(cur) = ticks {
-            self.prev = Some((now, cur));
-        }
+        let now = Instant::now();
+        let cpu_percent = self.sample_cpu_at(now, read_cpu_ticks());
         let (mem_used_bytes, mem_total_bytes) = read_memory();
         let disk = dirs::home_dir().and_then(|home| read_disk(&home));
         HostVitals {
@@ -154,6 +132,26 @@ impl VitalsSampler {
             disk_used_bytes: disk.map(|(used, _)| used),
             disk_available_bytes: disk.map(|(_, available)| available),
         }
+    }
+
+    /// Whether a successful CPU counter reading is held. A second sample may
+    /// produce a percentage, but this does not guarantee it: the OS can return
+    /// unchanged counters (macOS may serve cached host statistics), fail a read,
+    /// or reset its counters. A reading can also age past [`MAX_CPU_WINDOW`].
+    pub fn has_reading(&self) -> bool {
+        self.prev.is_some()
+    }
+
+    /// Difference supplied counters at a supplied time so tests can exercise
+    /// cached, missing and reset OS readings without relying on host timing.
+    fn sample_cpu_at(&mut self, now: Instant, ticks: Option<CpuTicks>) -> Option<f32> {
+        let percent = ticks.and_then(|cur| cpu_since(self.prev, cur, now));
+        // Keep the last successful reading across a transient failure. Replace
+        // stale or reset counters so a later advancing sample can recover.
+        if let Some(cur) = ticks {
+            self.prev = Some((now, cur));
+        }
+        percent
     }
 }
 
@@ -516,10 +514,54 @@ mod tests {
     #[test]
     fn the_first_sample_carries_no_cpu_figure() {
         let mut sampler = VitalsSampler::new();
+        let now = Instant::now();
+        let ticks = CpuTicks {
+            busy: 100,
+            total: 1000,
+        };
         assert!(!sampler.has_reading());
-        assert_eq!(sampler.sample().cpu_percent, None);
-        // Now armed, so a caller knows a second sample would carry a figure.
-        assert_eq!(sampler.has_reading(), read_cpu_ticks().is_some());
+        assert_eq!(sampler.sample_cpu_at(now, None), None);
+        assert!(!sampler.has_reading());
+        assert_eq!(sampler.sample_cpu_at(now, Some(ticks)), None);
+        assert!(sampler.has_reading());
+    }
+
+    #[test]
+    fn readable_cpu_counters_need_not_produce_a_percentage() {
+        let mut sampler = VitalsSampler::new();
+        let start = Instant::now();
+        let ticks = CpuTicks {
+            busy: 100,
+            total: 1000,
+        };
+        assert_eq!(sampler.sample_cpu_at(start, Some(ticks)), None);
+
+        // Model repeated cached macOS statistics, then a failed read. Even
+        // with time advancing and a baseline held, neither means 0% CPU.
+        for (step, reading) in [Some(ticks), Some(ticks), None].into_iter().enumerate() {
+            let now = start + Duration::from_millis(200 * (step as u64 + 1));
+            assert_eq!(sampler.sample_cpu_at(now, reading), None);
+            assert!(sampler.has_reading());
+        }
+        let advanced = CpuTicks {
+            busy: 125,
+            total: 1100,
+        };
+        assert_eq!(
+            sampler.sample_cpu_at(start + Duration::from_secs(1), Some(advanced)),
+            Some(25.0)
+        );
+
+        // A reset drops only the invalid interval, then becomes the baseline.
+        assert_eq!(
+            sampler.sample_cpu_at(start + Duration::from_secs(2), Some(ticks)),
+            None
+        );
+        assert!(sampler.has_reading());
+        assert_eq!(
+            sampler.sample_cpu_at(start + Duration::from_secs(3), Some(advanced)),
+            Some(25.0)
+        );
     }
 
     /// A reading from before the window is a claim about a *gap*, not about
@@ -561,9 +603,23 @@ mod tests {
     fn a_stale_sample_still_re_arms_the_sampler() {
         let mut sampler = VitalsSampler::new();
         let start = Instant::now();
-        sampler.sample_at(start);
+        let ticks = CpuTicks {
+            busy: 100,
+            total: 1000,
+        };
+        sampler.sample_cpu_at(start, Some(ticks));
         let late = start + MAX_CPU_WINDOW * 2;
-        assert_eq!(sampler.sample_at(late).cpu_percent, None);
-        assert_eq!(sampler.has_reading(), read_cpu_ticks().is_some());
+        assert_eq!(sampler.sample_cpu_at(late, Some(ticks)), None);
+        assert!(sampler.has_reading());
+        assert_eq!(
+            sampler.sample_cpu_at(
+                late + Duration::from_secs(1),
+                Some(CpuTicks {
+                    busy: 125,
+                    total: 1100,
+                })
+            ),
+            Some(25.0)
+        );
     }
 }

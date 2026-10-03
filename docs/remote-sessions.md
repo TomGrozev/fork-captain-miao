@@ -443,8 +443,11 @@ GetVitals{req_id}                      Vitals{req_id, vitals}
     between two readings of a monotonic counter, so on-demand sampling has to
     say what "now" means: `MAX_CPU_WINDOW` (60s) discards a previous reading too
     old to describe the present, and the daemon then takes a second reading
-    200ms later so the *first* poll after opening the panel already carries a
-    figure instead of leaving the column blank for a whole interval.
+    200ms later to try to provide CPU on the first poll. This is best effort:
+    macOS may return cached counters, and reads can fail or counters reset.
+    Having a baseline does not guarantee a percentage. After one priming
+    attempt the daemon returns the available metrics with CPU absent if
+    necessary, rather than reporting a false 0% or waiting for more samples.
   * **The daemon caches for 10s**, deliberately shorter than the poll interval:
     a lone dashboard therefore gets a genuinely fresh probe every time it asks,
     while several watching one host collapse onto a single probe. The cache is

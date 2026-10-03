@@ -84,9 +84,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(200);
 /// reading instead of one probe each.
 const VITALS_CACHE: Duration = Duration::from_secs(10);
 /// The gap between the two readings taken when the sampler has no usable
-/// previous one (the first poll, or the first after a long quiet spell). Long
-/// enough for the tick counters to move, short enough to be invisible in the
-/// reply — the alternative is a blank CPU column until the *next* poll.
+/// previous one (the first poll, or the first after a long quiet spell). This
+/// usually lets counters advance, but the OS may return cached or unavailable
+/// counters again. Priming is best effort; do not keep a reply waiting for CPU.
 const VITALS_PRIME_GAP: Duration = Duration::from_millis(200);
 
 // =============================================================================
@@ -722,12 +722,10 @@ impl VitalsProbe {
         // A filesystem query can wait on storage. Keep both it and CPU priming
         // off Tokio's workers; the probe lock still coalesces concurrent asks.
         let Ok((sampler, vitals)) = tokio::task::spawn_blocking(move || {
-            let mut vitals = sampler.sample();
-            // The first reading (or one after a long gap) only primes CPU.
-            if vitals.cpu_percent.is_none() && sampler.has_reading() {
-                std::thread::sleep(VITALS_PRIME_GAP);
-                vitals = sampler.sample();
-            }
+            let vitals = sample_primed_vitals(
+                || (sampler.sample(), sampler.has_reading()),
+                || std::thread::sleep(VITALS_PRIME_GAP),
+            );
             (sampler, vitals)
         })
         .await
@@ -736,6 +734,22 @@ impl VitalsProbe {
         };
         self.sampler = sampler;
         self.last = Some((Instant::now(), vitals));
+        vitals
+    }
+}
+
+/// Try one additional sample when CPU has a baseline but no percentage yet.
+/// `has_reading` does not promise advancing counters: macOS can cache them.
+/// Keep the second answer's other fields even if CPU remains unavailable.
+fn sample_primed_vitals(
+    mut sample: impl FnMut() -> (HostVitals, bool),
+    wait: impl FnOnce(),
+) -> HostVitals {
+    let (vitals, has_reading) = sample();
+    if vitals.cpu_percent.is_none() && has_reading {
+        wait();
+        sample().0
+    } else {
         vitals
     }
 }
@@ -1601,17 +1615,67 @@ mod tests {
         std::fs::remove_file(control_path).unwrap();
     }
 
-    /// Two properties of the on-demand probe, and both are why the client can
-    /// poll bluntly: the *first* answer already carries a CPU figure (it primes
-    /// rather than making the panel wait a whole interval for one), and a second
-    /// ask inside the window is served from the cache — which is what keeps a
-    /// host watched by several dashboards to one probe.
+    #[test]
+    fn vitals_priming_preserves_both_advancing_and_unavailable_cpu() {
+        let first = HostVitals {
+            mem_used_bytes: Some(40),
+            mem_total_bytes: Some(100),
+            ..Default::default()
+        };
+        for cpu_percent in [Some(25.0), None] {
+            let second = HostVitals {
+                cpu_percent,
+                mem_used_bytes: Some(50),
+                disk_used_bytes: Some(60),
+                disk_available_bytes: Some(40),
+                ..first
+            };
+            let mut readings = [(first, true), (second, true)].into_iter();
+            let mut waited = false;
+            let result = sample_primed_vitals(
+                || {
+                    readings
+                        .next()
+                        .expect("priming must stop after two samples")
+                },
+                || waited = true,
+            );
+            assert!(waited, "a cold sampler gets one chance to prime CPU");
+            assert!(readings.next().is_none());
+            assert_eq!(result, second, "preserve absent CPU and the other readings");
+        }
+    }
+
+    #[test]
+    fn vitals_priming_skips_waits_for_ready_cpu_or_missing_counters() {
+        for (cpu_percent, has_reading) in [(Some(25.0), true), (None, false)] {
+            let first = HostVitals {
+                cpu_percent,
+                mem_used_bytes: Some(40),
+                mem_total_bytes: Some(100),
+                ..Default::default()
+            };
+            let mut readings = [(first, has_reading)].into_iter();
+            let result = sample_primed_vitals(
+                || readings.next().expect("no second sample is needed"),
+                || panic!("no priming wait is needed"),
+            );
+            assert_eq!(result, first);
+        }
+    }
+
+    /// Exercise the real OS sampler and shared cache, allowing partial readings.
+    /// CPU availability depends on the OS: two successful reads can return the
+    /// same counters. The deterministic tests above pin the priming policy.
     #[tokio::test]
-    async fn the_first_probe_primes_and_the_next_is_cached() {
+    async fn vitals_probe_caches_available_readings_and_refreshes_after_expiry() {
         let mut probe = VitalsProbe::new();
         let first = probe.get().await;
-        // Exactly on the platforms whose counters we can read at all.
-        assert_eq!(first.cpu_percent.is_some(), probe.sampler.has_reading());
+        assert!(
+            first
+                .cpu_percent
+                .is_none_or(|cpu| (0.0..=100.0).contains(&cpu))
+        );
 
         let stamp = probe.last.expect("a probe was taken").0;
         let cached = probe.get().await;
