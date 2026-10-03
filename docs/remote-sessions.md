@@ -676,6 +676,11 @@ the full sequence and re-runs it on every reconnect:
    `Disconnected → Connected` edge bumps a **reconnect epoch**, which is what
    the auto-reattach sweep watches (§7).
 
+   Connection loss is determined by the protocol stream. An SSH mux client can
+   exit successfully while the shared ControlMaster continues forwarding;
+   treating that child exit as a disconnect tears down a healthy connection
+   and repeats the same mistake on every retry.
+
 Round-trip time is sampled from ordinary request traffic (`RemoteBackend::request`
 times the oneshot) — there is deliberately **no `Ping` frame**: every reply is
 already `req_id`-matched, so timing one is free.

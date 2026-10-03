@@ -2591,7 +2591,7 @@ async fn connection_task(
                 }
             }
         };
-        let Some((sock_path, mut ssh_child)) = established else {
+        let Some((sock_path, ssh_child)) = established else {
             // A diagnosable cause (server missing, version mismatch, host
             // unreachable) is surfaced verbatim instead of a bare ⚠ (§4). The
             // task keeps retrying either way — `Failed` is a *label*, not a
@@ -2647,8 +2647,9 @@ async fn connection_task(
         log.info("connected");
         store(ConnState::Connected);
         let connected_at = Instant::now();
-        let serving = serve(
+        let outcome = serve(
             stream,
+            ssh_child,
             MirrorCells {
                 mirror: &mirror,
                 presumed_dead: &presumed_dead,
@@ -2658,15 +2659,8 @@ async fn connection_task(
                 server_version: &server_version,
             },
             &mut requests,
-        );
-        let outcome = if let Some(tunnel) = ssh_child.as_mut() {
-            tokio::select! {
-                outcome = serving => outcome,
-                _ = tunnel.wait() => ServeOutcome::ConnectionLost,
-            }
-        } else {
-            serving.await
-        };
+        )
+        .await;
         // Forget remembered deploy failures and refusals only once the host has
         // *demonstrably* worked — which means the handshake and subscribe both
         // succeeded, not merely that a socket accepted us. Clearing at connect
@@ -2684,7 +2678,6 @@ async fn connection_task(
         if let Some(forwards) = &forwards {
             forwards.disconnected().await;
         }
-        drop(ssh_child); // explicit: kill the ssh child once the connection ends
         // The mirror is now stale; clear it so the host shows no (misleading)
         // rows while disconnected. A fresh `Snapshot` refills it on reconnect.
         // `store(Disconnected)` below flips `dirty` so the cleared rows redraw.
@@ -3373,8 +3366,14 @@ struct MirrorCells<'a> {
 /// Handshake, subscribe, then multiplex the pushed session stream into the
 /// mirror with request/response, until the peer hangs up or the backend drops.
 /// The [`ServeOutcome`] tells the caller whether to reconnect and how fast.
+///
+/// Keep the optional SSH child owned until serving ends, so `kill_on_drop`
+/// still cleans up a standalone tunnel. Its exit is not a disconnect signal:
+/// a mux client can exit successfully while the ControlMaster keeps forwarding.
+/// The protocol stream is the authority on connection loss.
 async fn serve(
     stream: UnixStream,
+    _ssh_child: Option<tokio::process::Child>,
     cells: MirrorCells<'_>,
     requests: &mut mpsc::UnboundedReceiver<PendingRequest>,
 ) -> ServeOutcome {
@@ -3564,6 +3563,7 @@ mod tests {
             let (tx, mut requests) = mpsc::unbounded_channel();
             let connection = serve(
                 client,
+                None,
                 MirrorCells {
                     mirror: &mirror,
                     presumed_dead: &presumed_dead,
@@ -5657,6 +5657,211 @@ fi
             .await
             .unwrap();
         while matches!(read_frame::<_, ClientFrame>(&mut rd).await, Ok(Some(_))) {}
+    }
+
+    #[tokio::test]
+    async fn a_standalone_tunnel_lives_until_the_backend_is_dropped() {
+        use tokio::io::AsyncReadExt;
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut tunnel = detached("sleep")
+            .arg("60")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut output = tunnel.stdout.take().unwrap();
+        let (backend, shared, mut requests) = RemoteBackend::build(
+            &Transport::LocalSocket(PathBuf::new()),
+            HostId("mock".into()),
+        );
+        write_frame(
+            &mut server,
+            &ServerFrame::Welcome {
+                server_version: "test".into(),
+                protocol: PROTOCOL_VERSION,
+                host: "mock".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let connection = serve(
+            client,
+            Some(tunnel),
+            MirrorCells {
+                mirror: &shared.mirror,
+                presumed_dead: &shared.presumed_dead,
+                presumed_attached: &shared.presumed_attached,
+                dirty: &shared.dirty,
+                mirrored: &shared.mirrored,
+                server_version: &shared.server_version,
+            },
+            &mut requests,
+        );
+        tokio::pin!(connection);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut connection)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), output.read_u8())
+                .await
+                .is_err(),
+            "the tunnel must remain alive while serving"
+        );
+        drop(backend);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), &mut connection)
+                .await
+                .unwrap(),
+            ServeOutcome::BackendDropped,
+        );
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), output.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "dropping the backend must kill its standalone tunnel",
+        );
+    }
+
+    /// The real SSH client asks an existing master to own the forward. Its
+    /// process and the protocol stream have independent lifetimes.
+    #[tokio::test]
+    async fn a_mux_forwarder_exit_keeps_the_protocol_connection_alive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = scratch_home("mux-connection");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let control = dir.join("control.sock");
+        let forwarded = dir.join("forward.sock");
+        let listener = UnixListener::bind(&control).unwrap();
+        let forward_path = forwarded.clone();
+        // A tiny mux peer acknowledges the forward and keeps its listener.
+        // No SSH daemon, authentication or network connection is involved.
+        let master = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut forward = None;
+            while let Ok(length) = stream.read_u32().await {
+                assert!(length <= 4096);
+                let mut frame = vec![0; length as usize];
+                stream.read_exact(&mut frame).await.unwrap();
+                let word = |i| u32::from_be_bytes(frame[i..i + 4].try_into().unwrap());
+                let response = match word(0) {
+                    1 => vec![1_u32, 4], // MUX_MSG_HELLO
+                    0x10000004 => vec![0x80000005, word(4), std::process::id()],
+                    0x10000006 => {
+                        assert_eq!(word(8), 1, "one local forward");
+                        forward = Some(UnixListener::bind(&forward_path).unwrap());
+                        vec![0x80000001, word(4)] // MUX_S_OK
+                    }
+                    0x10000002 => {
+                        // SSH also opens a mux session with -N. Discard the
+                        // three stdio fd messages, then model the session
+                        // ending normally on its /dev/null stdin. The master
+                        // continues to own the forwarding listener.
+                        for _ in 0..3 {
+                            stream.read_u8().await.unwrap();
+                        }
+                        for response in [
+                            [0x80000006, word(4), 1], // MUX_S_SESSION_OPENED
+                            [0x80000004, 1, 0],       // MUX_S_EXIT_MESSAGE
+                        ] {
+                            stream.write_u32(12).await.unwrap();
+                            for word in response {
+                                stream.write_u32(word).await.unwrap();
+                            }
+                        }
+                        break;
+                    }
+                    kind => panic!("unexpected mux operation {kind:x}"),
+                };
+                stream.write_u32((response.len() * 4) as u32).await.unwrap();
+                for word in response {
+                    stream.write_u32(word).await.unwrap();
+                }
+            }
+            forward.expect("SSH requested the forward")
+        });
+        let mut tunnel = detached("ssh")
+            .args(ssh_common_opts(
+                &control,
+                &[
+                    "-F".into(),
+                    "/dev/null".into(),
+                    "-oProxyCommand=false".into(),
+                ],
+            ))
+            .arg("-L")
+            .arg(format!("{}:/remote/daemon.sock", forwarded.display()))
+            .args(["-N", "test-host"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), tunnel.wait())
+            .await
+            .expect("the mux client exits after registering its forward")
+            .unwrap();
+        assert!(status.success(), "the SSH forward was accepted: {status}");
+        let listener = master.await.unwrap();
+        let server = tokio::spawn(mock_server(listener, vec![test_state(42)]));
+        let stream = UnixStream::connect(&forwarded).await.unwrap();
+        let (backend, shared, mut requests) =
+            RemoteBackend::build(&Transport::LocalSocket(forwarded), HostId("mock".into()));
+        let connection = serve(
+            stream,
+            Some(tunnel),
+            MirrorCells {
+                mirror: &shared.mirror,
+                presumed_dead: &shared.presumed_dead,
+                presumed_attached: &shared.presumed_attached,
+                dirty: &shared.dirty,
+                mirrored: &shared.mirrored,
+                server_version: &shared.server_version,
+            },
+            &mut requests,
+        );
+        tokio::pin!(connection);
+        let (reply, mut response) = oneshot::channel();
+        backend
+            .requests
+            .send(PendingRequest {
+                req_id: 1,
+                frame: ClientFrame::ListRecentDirs { req_id: 1 },
+                reply,
+            })
+            .unwrap();
+        let result = tokio::select! {
+            outcome = &mut connection => panic!(
+                "dashboard disconnected after SSH accepted the forward: {outcome:?}"
+            ),
+            reply = tokio::time::timeout(Duration::from_secs(2), &mut response) => reply,
+        };
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            ServerFrame::RecentDirs { .. }
+        ));
+        assert!(shared.mirrored.load(Ordering::Relaxed));
+        assert_eq!(backend.list_sessions().len(), 1);
+
+        // A real stream loss must still tell connection_task to reconnect.
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), &mut connection)
+                .await
+                .unwrap(),
+            ServeOutcome::ConnectionLost,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
