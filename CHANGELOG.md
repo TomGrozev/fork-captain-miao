@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-03
+
+### Added
+
+- **SSH agent forwarding for Git push and pull** follows your SSH configuration
+  (for example, `ForwardAgent yes` for a trusted host), with no separate host
+  toggle, giving remote Git commands access to your local agent only during
+  network operations; update `miao-server` to use it.
+- **Work tab commands** receive `$MIAO_WORKDIR` (the project directory, such as
+  `/work/payments-api`) and `$MIAO_WORKSPACE` (a stable name that includes the
+  project directory name, such as `miao-payments-api-8c583c4f053ebee9`),
+  letting you reopen the same terminal multiplexer workspace.
+
+  Set the host's **Work tab command** to either example, then press `w` on a
+  session:
+
+  [Zellij](https://zellij.dev/documentation/commands):
+
+  ```sh
+  zellij attach --create "$MIAO_WORKSPACE" options --default-cwd "$MIAO_WORKDIR"
+  ```
+
+  [tmux](https://man.openbsd.org/tmux.1):
+
+  ```sh
+  tmux new-session -A -s "$MIAO_WORKSPACE" -c "$MIAO_WORKDIR"
+  ```
+
+### Changed
+
+- **The Hosts panel** has been redesigned.
+- **Work tabs** running a configured command close when it finishes successfully
+  (for example, after detaching from Zellij or tmux), and stay open on errors
+  so you can read the message and retry.
+
+### Fixed
+
+- **Work tabs** (`w`) honor SSH agent forwarding settings on independent
+  connections; forwarding stays disabled on the shared server connection.
+- **Remote connections** no longer reconnect endlessly when reusing an existing
+  SSH connection.
+- **Connection attempts** stop when hosts are removed and retry automatically
+  after a timeout if the server never answers.
+- **Session updates** no longer wait for slow port forwards or clipboard setup.
+- **Timed-out remote commands** are discarded if unsent, preventing delayed
+  actions such as killing sessions.
+- **SSH forwarding controls** honor custom SSH ports, such as port `2222`, and
+  connection-socket paths.
+- **Server recovery** waits for healthy servers to restore missing sockets,
+  avoiding unnecessary restarts and session loss.
+- **Concurrent server downloads** no longer overwrite or delete each other's
+  unfinished files during provisioning.
+
+### Security
+
+- **Clipboard sharing** stops new reads and active transfers when you turn it
+  off or disable or remove the host—for example, turning it off during a
+  screenshot paste cuts off the remaining transfer even if SSH cleanup is stuck.
+
+  If two host rows share the same SSH connection and clipboard endpoint, disable
+  sharing on both to fully revoke access.
+
+- **SSH socket directories** are private and checked before use—for example,
+  on a shared computer, the dashboard refuses a socket directory owned by another
+  account or a symlink pointing to a different location.
+
 ## [0.10.0] - 2026-10-02
 
 ### Added
@@ -666,7 +732,8 @@ cut. 0.2.0 is the first version published as a complete set.)
 - **Linux binaries are glibc builds** (built against glibc 2.35, so Ubuntu
   22.04+, Debian 12+, RHEL 9+). musl/Alpine needs a source build.
 
-[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/hyperlogue/captain-miao/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/hyperlogue/captain-miao/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/hyperlogue/captain-miao/compare/v0.9.3...v0.10.0
 [0.9.3]: https://github.com/hyperlogue/captain-miao/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/hyperlogue/captain-miao/compare/v0.9.1...v0.9.2
