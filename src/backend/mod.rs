@@ -123,14 +123,14 @@ fn detached(program: &str) -> Command {
 /// forwards), the third lets ssh prompt on a child whose stdin is `/dev/null`.
 /// Documented where the field is edited rather than blocked — an escape hatch
 /// that second-guesses isn't one. Agent forwarding is the exception: it stays
-/// disabled on these calls and is offered only by separate Git sessions.
+/// disabled on these calls; work tabs and Git use independent sessions.
 ///
 /// An *edit* to any of these takes effect only because
 /// [`changed_connection_options`] retires the previous master first;
 /// re-dialling on its own would re-join it and change nothing.
 fn ssh_common_opts(ctl: &Path, extra: &[String]) -> Vec<String> {
-    // Agent access belongs to short Git sessions, never the shared master,
-    // provisioning, attach windows, or work tabs. The leading option overrides
+    // Agent access belongs to independent work-tab/Git sessions, never the
+    // shared master, provisioning or attach windows. The leading option overrides
     // ssh_config; the trailing -a also overrides command-line -A switches.
     let mut opts = vec!["-o".into(), "ForwardAgent=no".into()];
     opts.extend_from_slice(extra);
@@ -1430,7 +1430,6 @@ pub(crate) enum Transport {
         /// `-R` alongside the user's own forwards. See
         /// [`clipboard_forward`].
         clipboard: bool,
-        forward_agent: bool,
     },
 }
 
@@ -1463,8 +1462,6 @@ pub(crate) struct RemoteBackend {
     /// safe to repeat, which is what lets an attach window and the `w` shell
     /// carry them too. Empty for a socket transport, which runs no ssh.
     ssh_options: Vec<String>,
-    /// Enable a separate agent-forwarding SSH session for each network Git RPC.
-    forward_agent: AtomicBool,
     pub(crate) forwards: Option<Arc<forwards::Manager>>,
     /// Whether this backend's transport is [`Transport::LocalSocket`], i.e. the
     /// daemon is on *this* machine. Distinguishes pooled-localhost (where a
@@ -1730,13 +1727,6 @@ impl RemoteBackend {
         let presumed_attached = Arc::new(Mutex::new(HashMap::new()));
         let remote_exe = Arc::new(Mutex::new("miao-server".to_string()));
         let conn = Arc::new(Mutex::new(ConnState::Connecting));
-        let forward_agent = matches!(
-            transport,
-            Transport::Ssh {
-                forward_agent: true,
-                ..
-            }
-        );
         let dirty = Arc::new(AtomicBool::new(false));
         let mirrored = Arc::new(AtomicBool::new(false));
         let server_version = Arc::new(Mutex::new(None));
@@ -1786,7 +1776,6 @@ impl RemoteBackend {
             host,
             attach_target,
             ssh_options,
-            forward_agent: AtomicBool::new(forward_agent),
             forwards,
             transport_is_local,
             mirror,
@@ -1807,11 +1796,6 @@ impl RemoteBackend {
             log,
         });
         (backend, shared, rx)
-    }
-
-    /// Changes apply to the next Git request without replacing the host link.
-    pub(crate) fn set_git_agent_forwarding(&self, enabled: bool) {
-        self.forward_agent.store(enabled, Ordering::Relaxed);
     }
 
     /// Current connection health, for the header surface.
@@ -2397,8 +2381,9 @@ fn resolve_local_attach_exe<'a>(
 }
 
 /// The argv for a window that opens an interactive login shell on a remote host
-/// in `cwd`, over ssh (the `w` work tab), sharing the ControlMaster like
-/// [`attach_argv`]. `-t` forces a pty so the shell is interactive; the `cd`
+/// in `cwd`, over an independent ssh connection (the `w` work tab). Unlike
+/// [`attach_argv`], it follows the user's agent forwarding configuration.
+/// `-t` forces a pty so the shell is interactive; the `cd`
 /// lands in the session's workdir, then we hand off to the user's login shell
 /// (falling back to `/bin/sh`).
 ///
@@ -2460,8 +2445,8 @@ fn remote_shell_argv(
             cm_core::paths::shell_quote_host_path(cwd)
         )
     };
-    let mut argv = vec!["ssh".to_string(), "-t".to_string()];
-    argv.extend(ssh_common_opts(&state::ssh_control_path(target), options));
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(ssh::session_options(options, true));
     argv.push(target.to_string());
     argv.push(remote_cmd);
     argv

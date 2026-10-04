@@ -476,7 +476,6 @@ mod tests {
             options: vec![],
             forwards: vec![],
             clipboard: true,
-            forward_agent: false,
         };
         let (backend, shared, _requests) = RemoteBackend::build(&transport, HostId("test".into()));
         let access = shared.clipboard.as_ref().unwrap();

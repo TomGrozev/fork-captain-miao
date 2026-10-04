@@ -2574,7 +2574,6 @@ impl App {
                 options: options.clone(),
                 forwards,
                 clipboard: *clipboard,
-                forward_agent: false,
             },
         };
         Backend::Remote(RemoteBackend::connect(transport, host))
@@ -2706,11 +2705,9 @@ impl App {
             });
             if let Backend::Remote(remote) = &backend
                 && let Some(host) = hosts.iter().find(|h| h.label == identity.label)
+                && let Some(manager) = &remote.forwards
             {
-                remote.set_git_agent_forwarding(host.forward_agent);
-                if let Some(manager) = &remote.forwards {
-                    manager.configure(host.forwards.clone());
-                }
+                manager.configure(host.forwards.clone());
             }
             self.backends.push(backend);
         }
@@ -2781,7 +2778,6 @@ impl App {
                 icon: picker::TextInput::with_text(h.icon.unwrap_or_default()),
                 disabled: h.disabled,
                 clipboard: h.clipboard,
-                forward_agent: h.forward_agent,
                 // Quote argv values so spaces survive reopening the editor.
                 options: picker::TextInput::with_text(shell_words::join(h.options)),
                 shell_command: picker::TextInput::with_text(h.shell_command.unwrap_or_default()),

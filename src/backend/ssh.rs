@@ -1,5 +1,83 @@
-//! Local SSH endpoints: private socket directories and consistent master paths.
+//! SSH connection policies, private socket directories and consistent master paths.
 use super::*;
+
+/// Fresh Git/work-tab connection, with forwarding decided by OpenSSH config.
+/// Keep it independent of the non-forwarding dashboard master and any external
+/// master, and end it with its owning command instead of persisting it.
+/// Retain authentication/routing settings but override modes that would detach
+/// this child, share a connection, or replace its session command. ssh's short
+/// flags override even preceding -o settings, so strip them as well.
+pub(super) fn session_options(options: &[String], tty: bool) -> Vec<String> {
+    let mut opts: Vec<String> = [
+        "ControlPath=none",
+        "ControlMaster=no",
+        "ControlPersist=no",
+        "ForkAfterAuthentication=no",
+        "StdinNull=no",
+        "SessionType=default",
+        "RemoteCommand=none",
+        "ClearAllForwardings=yes",
+        "PermitLocalCommand=no",
+        "Tunnel=no",
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".into(), option.into()])
+    .collect();
+    // Git cannot prompt on a detached child. Work tabs retain the existing
+    // ability to override BatchMode through Advanced SSH options.
+    if !tty {
+        opts.extend(["-o".into(), "BatchMode=yes".into()]);
+    }
+    let mut rest = options.iter();
+    while let Some(arg) = rest.next() {
+        let Some(flags) = arg.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            opts.push(arg.clone());
+            continue;
+        };
+        let mut kept = String::from("-");
+        for (index, flag) in flags.char_indices() {
+            if "BbceEFIiJlmopPQSLRDOWw".contains(flag) {
+                let value = &flags[index + flag.len_utf8()..];
+                let separate = value.is_empty().then(|| rest.next()).flatten();
+                if !"SOWwLRD".contains(flag) {
+                    kept.push(flag);
+                    kept.push_str(value);
+                    opts.push(kept.clone());
+                    if let Some(value) = separate {
+                        opts.push(value.clone());
+                    }
+                    kept.clear();
+                }
+                break;
+            }
+            if !"fnNMtTs".contains(flag) {
+                kept.push(flag);
+            }
+        }
+        if kept.len() > 1 {
+            opts.push(kept);
+        }
+    }
+    // The short switches also win over conflicting command-line -o options.
+    opts.extend([
+        "-S".into(),
+        "none".into(),
+        if tty { "-t".into() } else { "-T".into() },
+    ]);
+    // Connection defaults remain overridable. Never supply ForwardAgent here:
+    // OpenSSH owns its precedence, including -A/-a and agent socket paths.
+    opts.extend([
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "ServerAliveInterval=15".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+    ]);
+    opts
+}
 
 pub(super) async fn forward(
     target: &str,

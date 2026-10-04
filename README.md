@@ -516,19 +516,31 @@ reconnect, `f` for port forwards, and `u` to upgrade the server when available.
 - **Advanced SSH options** accepts quoted SSH arguments; machine setup normally
   belongs in `~/.ssh/config`. Changing these connection options can reconnect
   the host. The forwarding list manages ports independently.
-- **Git SSH agent** — edit an SSH host with `Space h` → `e`, find this field
-  under Services (`Alt+3`), and toggle it with Space. Off by default; Enter
-  applies it to subsequent Git commands without reconnecting the host. Push/pull network
-  requests open a fresh SSH connection with agent forwarding, pass its socket
-  only to that Git request, and close it when the request ends. Pull preparation
-  also uses a short connection to check and fetch the remote branch; forwarding
-  is closed while you review the confirmation. The host connection, attached
-  sessions, and work tabs keep forwarding disabled. Start the dashboard with
-  access to your agent, usually through `SSH_AUTH_SOCK` or SSH's `IdentityAgent`
-  setting. Git commands require an updated `miao-server`; the daemon's startup
-  environment does not need to change. The setting is `forward_agent` in
-  `hosts.json`. Only enable it for hosts you trust: the remote account or root
-  can request authentication through your agent while the Git request runs.
+- **SSH agent forwarding** — work tabs and dashboard Git push/pull follow
+  `ForwardAgent` in your SSH configuration and Advanced SSH options; there is
+  no separate captain-miao toggle. For example, set `ForwardAgent yes` in the
+  matching `Host` entry in `~/.ssh/config`. Work tabs use independent SSH
+  connections, with forwarding lasting until that connection closes. The
+  shared server connection, provisioning and pooled-session attachments always
+  disable forwarding.
+
+  Before network Git requests, the dashboard checks the effective SSH setting.
+  When forwarding is off, Git uses the remote host's existing authentication
+  without opening another connection. When on, each request opens a fresh SSH
+  connection, passes its agent socket only to that Git request, and closes it
+  when the request ends. Pull preparation also uses a short connection to check
+  and fetch the branch; forwarding closes while you review the confirmation.
+  If SSH provides no agent, the extra connection closes and Git uses the
+  remote host's existing authentication, as it does when forwarding is off.
+  Start the dashboard with access to your agent, usually through `SSH_AUTH_SOCK`
+  or SSH's `IdentityAgent` setting. Forwarded Git requests require an updated
+  `miao-server`; the daemon's startup environment does not need to change.
+  Changes to SSH configuration apply to new work tabs and subsequent Git
+  requests. Old `forward_agent` values in `hosts.json` are ignored.
+  Existing shells inside a persistent tmux or Zellij session can retain an old
+  `SSH_AUTH_SOCK`; reconnecting SSH does not update those running processes.
+  Only enable forwarding for hosts you trust: the remote account or root can
+  use your agent while the forwarding connection is open.
 - **Work tab command** — edit an SSH host with `Space h` → `e` and set this
   optional field to a shell command. Pressing `w` on one of that host's sessions
   opens a work tab in its directory and runs the command in the remote user's

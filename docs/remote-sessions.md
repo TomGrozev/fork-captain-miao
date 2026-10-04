@@ -220,8 +220,8 @@ library**.
     and the secret is readable by every local account on the host.
 
     A remote attach arrives with agent forwarding disabled, so the hardening
-    never fires. The per-host `Git SSH agent` setting only forwards an agent
-    for network Git requests, leaving attaches without `SSH_AUTH_SOCK`. A local
+    never fires. Git and work tabs follow SSH configuration on independent
+    connections, leaving attaches without `SSH_AUTH_SOCK`. A local
     desktop attach usually *does* have one and so lands `0700` — which makes this
     worse, not better: the protection is incidental, and it is absent precisely in the
     remote-container case this feature exists to serve.
@@ -622,18 +622,26 @@ the full sequence and re-runs it on every reconnect:
    `ControlMaster=auto` + per-host `ControlPath` + `BatchMode` (key/agent auth
    only). Steps 1–3 ride one authenticated TCP connection.
 
-   The shared master, provisioning, attach windows and work tabs always use
+   The shared master, provisioning and attach windows always use
    `ForwardAgent=no` and `-a`, even if SSH configuration enables forwarding.
-   The host's `Git SSH agent` field (`forward_agent` in `hosts.json`, default
-   false) applies only to network Git RPCs. A separate SSH child uses
-   `ForwardAgent=yes`, `ControlPath=none`, `ControlMaster=no`, and
-   `ControlPersist=no`; it never joins the shared master or backgrounds itself.
-   Authentication and routing options still apply, but session/multiplexing
-   overrides and unrelated port forwards do not. A POSIX shell reports its home
-   and `SSH_AUTH_SOCK`, then waits on dashboard-held stdin. The dashboard keeps
-   this child alive only until the Git reply, timeout, cancellation or link loss.
-   Missing or refused forwarding fails before submitting Git, with no fallback
-   to the daemon's inherited agent.
+   Work tabs and network Git RPCs follow `ForwardAgent` in SSH configuration
+   and Advanced SSH options. There is no per-host application toggle; obsolete
+   `forward_agent` fields in `hosts.json` are ignored. These connections use
+   `ControlPath=none`, `ControlMaster=no`, and `ControlPersist=no`; they never
+   join the shared master or background themselves. Authentication and routing
+   options still apply, but session/multiplexing overrides and unrelated port
+   forwards do not. Work tabs allocate a pty and retain forwarding for the life
+   of that SSH connection, independently of the dashboard.
+
+   For each network Git RPC, the dashboard evaluates the same connection options
+   with `ssh -G`. A disabled agent skips opening another connection. A reported
+   socket path is inconclusive: OpenSSH prints it even if `-a` has disabled
+   forwarding, so the session itself determines whether an agent is available.
+   A POSIX shell reports its home and `SSH_AUTH_SOCK`, then waits on
+   dashboard-held stdin. If no agent is reported, this connection closes and
+   Git uses the host's existing authentication. Otherwise the dashboard keeps
+   the child alive only until the Git reply, timeout, cancellation or link loss.
+   Configuration evaluation and connection setup share the RPC's deadline.
 
    `PrepareVcs` and `RunVcs` carry that socket in the additive `ssh_auth_sock`
    field, using host-canonical paths. The existing daemon receives the RPC over
@@ -642,11 +650,11 @@ the full sequence and re-runs it on every reconnect:
    instance identity. Push preparation needs no agent. Pull preparation checks
    and fetches the remote branch with its own short SSH connection; forwarding
    closes before confirmation and a new connection supplies the confirmed run.
-   An absent field preserves host authentication for disabled forwarding or
-   direct socket transports. Toggling the setting affects subsequent Git
-   requests without replacing the backend. The remote account or root can still
-   use the agent while it is forwarded; shortening its lifetime does not make
-   an untrusted host safe.
+   An absent field preserves host authentication when no agent is forwarded or
+   for direct socket transports. SSH config edits affect subsequent Git
+   requests and new work tabs without replacing the backend. The remote account
+   or root can still use the agent while it is forwarded; shortening its lifetime
+   does not make an untrusted host safe.
 
    Clipboard setup runs independently after the protocol handshake. Its `-R`
    points the host's `~/.cache/captain-miao/clipboard.sock` at a private local
