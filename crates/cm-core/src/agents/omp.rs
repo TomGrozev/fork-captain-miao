@@ -132,10 +132,22 @@ use tokio::process::Command;
 
 use super::common;
 use super::pi_extension::Extension;
-use crate::state::{HookEvent, HookMessage, LauncherState};
+use crate::agent::ResumeCandidate;
+use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
 pub(crate) const BIN: &str = "omp";
+
+/// omp's user-question tool — the `AskUserQuestion` analog. Verified in the
+/// installed binary: `packages/coding-agent/src/tools/ask.ts` defines
+/// `AskTool` with `name = "ask"` and `concurrency = "exclusive"`, so its
+/// `tool_execution_start` arrives as [`HookEvent::PreToolUse`] carrying
+/// `tool_name = "ask"`. That `"exclusive"` concurrency makes it a barrier in
+/// omp's tool loop (`Tgn`'s `V`/`ee` promise chains): every prior tool settles
+/// before `ask` starts and every later one waits on it, so no other tool can
+/// run while the question is up — this arm needs no Grok-style hold against a
+/// concurrent tool's `PostToolUse`.
+const ASK_TOOL: &str = "ask";
 
 // =============================================================================
 // The event table — the module's claim about what it subscribes to
@@ -336,17 +348,240 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 // Hook event → status mapping
 // =============================================================================
 
-/// omp departs from [`common::dispatch_default`] nowhere. The native →
-/// normalized renaming is done in the generated table ([`FORWARDED`]) rather
-/// than here, and the two payload-driven corrections are done in
-/// [`normalize_event`]. `agent_end` with a falsy `willContinue` means the
-/// shared `Stop` arm needs no help from a session file or a rollout scan, and
-/// the abort path settles too.
+/// omp departs from [`common::dispatch_default`] in one place: [`ASK_TOOL`].
+/// The native → normalized renaming is done in the generated table
+/// ([`FORWARDED`]) rather than here, and the two payload-driven corrections are
+/// done in [`normalize_event`]. `agent_end` with a falsy `willContinue` means
+/// the shared `Stop` arm needs no help from a session file or a rollout scan,
+/// and the abort path settles too.
 ///
-/// The wrapper stays so the seam keeps one callee per backend, and so the day
-/// omp grows a case of its own it has a place to land.
-pub fn dispatch_hook(state: &mut LauncherState, msg: HookMessage) {
+/// That one departure is `ask` — a blocking multiple-choice card, not work.
+/// Like Grok's `ask_user_question` and Reasonix's `ask` it is surfaced as
+/// [`SessionStatus::WaitingForDecision`] ("Decision"), the same bucket as
+/// Claude's `AskUserQuestion` and Codex's `request_user_input`; without an arm
+/// the row sits at plain `Active` for as long as the card is up. Its
+/// `PreToolUse` is the only signal — omp blocks on the answer — and a gated
+/// `ask` that also fires `tool_approval_requested` lands here too, so it reads
+/// as a question rather than a tool-approval gate. The question's own
+/// `PostToolUse` settles the row back to `Active` through the shared mapping,
+/// and [`ASK_TOOL`] explains why no hold is needed for another tool's events.
+pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
+    // `ask` is a question, not a tool call — see the doc comment. Both the
+    // tool-execution event and an approval gate on it read as a decision.
+    if matches!(
+        msg.event,
+        HookEvent::PreToolUse | HookEvent::PermissionRequest
+    ) && msg.tool_name.as_deref() == Some(ASK_TOOL)
+    {
+        common::adopt_session_facts(state, &mut msg);
+        state.status = SessionStatus::WaitingForDecision;
+        state.last_tool = msg.tool_name;
+        return;
+    }
     common::dispatch_default(state, msg)
+}
+
+// =============================================================================
+// Resume candidates
+// =============================================================================
+
+/// The sessions directory: `$PI_CODING_AGENT_DIR/sessions` when omp's documented
+/// override is set (omp calls it the "Session storage directory"; `--profile`
+/// rewrites it too), else `~/.omp/agent/sessions`. `None` means there is nowhere
+/// to look, which [`list_resumable`] answers as an empty list rather than an
+/// error.
+fn sessions_root() -> Option<PathBuf> {
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".omp/agent")))?;
+    Some(agent_dir.join("sessions"))
+}
+
+/// Every omp session under [`sessions_root`], newest first.
+///
+/// A session is a top-level `*.jsonl` file directly inside a `<sanitized-cwd>/`
+/// bucket. The same-stem **directory** beside each file is omp's artifact and
+/// subagent store, not another session, so only files are walked. Everything a
+/// [`ResumeCandidate`] needs sits in the file's first lines — the `session`
+/// header's `id` and `cwd`, the pad-rewritten `title` record omp keeps at line
+/// 1, and the first `message` whose role is `user` — so the `parentId` tree walk
+/// the old comment feared is not needed. That walk belongs to
+/// [`crate::agent::AgentControl::read_transcript_stats`], whose fold really does
+/// need the active leaf; a head read does not.
+///
+/// **A missing store is an empty list, not an error.** `LocalBackend` asks every
+/// backend in `AgentControl::ALL` whenever the picker opens and surfaces whatever
+/// errors come back (see `opencode::list_resumable` for the same argument), so
+/// refusing here would put an error in front of every user who never ran omp.
+pub fn list_resumable(limit: usize) -> Result<Vec<ResumeCandidate>> {
+    let Some(root) = sessions_root() else {
+        return Ok(Vec::new());
+    };
+    Ok(list_resumable_in(&root, limit))
+}
+
+/// The scan itself, split from `$PI_CODING_AGENT_DIR` resolution so a test can
+/// point it at a fixture tree without touching the environment.
+fn list_resumable_in(root: &Path, limit: usize) -> Vec<ResumeCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for cwd_dir in common::read_subdirs(root) {
+        let Ok(entries) = std::fs::read_dir(&cwd_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            // The same-stem directory beside a session file is not a session.
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            found.push((path, mtime));
+        }
+    }
+
+    // Newest first, decided before any file is opened so a picker costs one
+    // `read_dir` walk plus the head reads rather than a read per session that
+    // ever existed. `usize::MAX` because the cap applies to *valid candidates*:
+    // a headerless file must be skipped without spending one of the `limit`
+    // slots.
+    let mut out = Vec::new();
+    for (path, mtime) in common::newest_first(found, usize::MAX) {
+        if out.len() >= limit {
+            break;
+        }
+        let Some(head) = read_session_head(&path) else {
+            continue;
+        };
+        out.push(ResumeCandidate {
+            agent: crate::agent::AgentControl::Omp,
+            session_id: head.session_id,
+            cwd: head.cwd,
+            first_prompt: head.first_prompt,
+            custom_title: head.title,
+            // omp records no branch anywhere a candidate can read.
+            git_branch: None,
+            mtime,
+        });
+    }
+    out
+}
+
+/// How far into a file [`read_session_head`] goes before giving up. The header
+/// and first user message sit within the first handful of lines in practice;
+/// the cap is for the pathological file — a session with no user message at all
+/// — so opening the picker never reads a whole multi-megabyte transcript.
+const MAX_HEAD_LINES: usize = 400;
+const MAX_HEAD_BYTES: u64 = 512 * 1024;
+
+/// The parts of a session's opening lines a [`ResumeCandidate`] is built from.
+#[derive(Default)]
+struct SessionHead {
+    session_id: String,
+    cwd: String,
+    /// The `title` record's title (line 1, normally), else the session header's.
+    title: Option<String>,
+    first_prompt: Option<String>,
+}
+
+/// Read one session file's head, line by line, stopping at the first `user`
+/// message (or the cap). Unknown and malformed lines are skipped rather than
+/// abandoning the file: `thinking_level_change`, `model_usage`, `custom_message`
+/// and friends come before the first prompt.
+///
+/// `None` when the file has no `session` header, or the header names an empty
+/// `id`/`cwd` — the same policy as the other backends, since a candidate that
+/// resumes into the wrong place is worse than no row.
+fn read_session_head(path: &Path) -> Option<SessionHead> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut head = SessionHead::default();
+    let mut bytes: u64 = 0;
+    let mut line = Vec::new();
+    for _ in 0..MAX_HEAD_LINES {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            break;
+        }
+        bytes += line.len() as u64;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) {
+            match value.get("type").and_then(|t| t.as_str()) {
+                Some("title") => {
+                    if head.title.is_none() {
+                        head.title = title_field(&value);
+                    }
+                }
+                Some("session") => {
+                    head.session_id = string_field(&value, "id");
+                    head.cwd = string_field(&value, "cwd");
+                    if head.title.is_none() {
+                        head.title = title_field(&value);
+                    }
+                }
+                Some("message")
+                    if value.pointer("/message/role").and_then(|r| r.as_str()) == Some("user") =>
+                {
+                    head.first_prompt = user_prompt(&value);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if bytes >= MAX_HEAD_BYTES {
+            break;
+        }
+    }
+    if head.session_id.trim().is_empty() || head.cwd.trim().is_empty() {
+        return None;
+    }
+    Some(head)
+}
+
+/// A plain string field, or `""` when absent or not a string.
+fn string_field(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A non-blank `title` from a `title` record or a `session` header.
+fn title_field(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("title")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// The text of the first `user` message: every `text` part concatenated and
+/// whitespace-collapsed the way the other backends collapse a prompt. `None`
+/// for a user message that carries no text (an image-only turn).
+fn user_prompt(value: &serde_json::Value) -> Option<String> {
+    let text = match value.pointer("/message/content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let prompt = super::collapse_whitespace(&text);
+    (!prompt.is_empty()).then_some(prompt)
 }
 
 // =============================================================================
@@ -629,6 +864,75 @@ mod tests {
         assert_eq!(state.status, SessionStatus::Active);
     }
 
+    /// omp's `ask` tool renders a blocking multiple-choice card and blocks
+    /// until the user answers; its `tool_execution_start` is the only signal
+    /// the session is waiting. Without the dispatch arm the row sits at plain
+    /// `Active` for as long as the card is up.
+    #[test]
+    fn an_ask_question_holds_the_row_until_answered() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload(r#","tool_name":"ask""#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForDecision,
+            "the question card must read as a decision, not as work"
+        );
+        assert_eq!(state.last_tool.as_deref(), Some("ask"));
+
+        // The paired `tool_execution_end` fires once the user answers and
+        // settles the row back to `Active` through the shared mapping.
+        feed(
+            &mut state,
+            HookEvent::PostToolUse,
+            &payload(r#","tool_name":"ask""#),
+        );
+        assert_eq!(state.status, SessionStatus::Active);
+        assert_eq!(state.last_tool, None);
+    }
+
+    /// A gated `ask` — one that fires `tool_approval_requested` before its
+    /// card — must still read as a question, not as a tool-approval gate.
+    #[test]
+    fn a_gated_ask_reads_as_a_question_not_an_approval() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PermissionRequest,
+            &payload(r#","tool_name":"ask""#),
+        );
+        assert_eq!(
+            state.status,
+            SessionStatus::WaitingForDecision,
+            "an approval gate on `ask` is the question, not WaitingForApproval"
+        );
+        assert_eq!(state.last_tool.as_deref(), Some("ask"));
+    }
+
+    /// An interrupted question — the user aborts while the card is up — must
+    /// still settle the row; `agent_end` on the abort path arrives as `Stop`
+    /// and the shared arm takes it to `Idle`, never stranding Decision.
+    #[test]
+    fn an_interrupted_question_still_settles() {
+        let mut state = state_at(SessionStatus::Active);
+        feed(
+            &mut state,
+            HookEvent::PreToolUse,
+            &payload(r#","tool_name":"ask""#),
+        );
+        assert_eq!(state.status, SessionStatus::WaitingForDecision);
+
+        feed(&mut state, HookEvent::Stop, &payload(""));
+        assert_eq!(
+            state.status,
+            SessionStatus::Idle,
+            "an aborted question must not strand the row in Decision"
+        );
+    }
+
     /// **The point of registering `session_switch`.** omp emits it on `/new`,
     /// `/fork` and `/resume`, and an in-session `/resume` or `/fork` must move
     /// the session id — `r`/`f` resume from `state.session_id`. A `SessionStart`
@@ -651,5 +955,224 @@ mod tests {
         );
         // The title rides the same payload, so it is adopted too.
         assert_eq!(state.name.as_deref(), Some("forked"));
+    }
+
+    /// Write one session file under `<root>/<bucket>/<name>`, creating the
+    /// bucket, and pin its mtime so "newest first" is a fact of the test rather
+    /// than a race between two writes.
+    fn write_session(root: &Path, bucket: &str, name: &str, body: &str, secs: u64) -> PathBuf {
+        let dir = root.join(bucket);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+        path
+    }
+
+    /// A `session` header line, with an optional `title` the way omp writes one
+    /// on a session it has already titled.
+    fn header(id: &str, cwd: &str, title: Option<&str>) -> String {
+        let title = title
+            .map(|t| format!(r#","title":"{t}""#))
+            .unwrap_or_default();
+        format!(r#"{{"type":"session","version":3,"id":"{id}","cwd":"{cwd}"{title}}}"#)
+    }
+
+    /// The pad-rewritten `title` record omp keeps at line 1.
+    fn title_record(title: &str) -> String {
+        format!(r#"{{"type":"title","v":1,"title":"{title}","source":"auto"}}"#)
+    }
+
+    /// A `message` line whose role is `user`.
+    fn user_message(text: &str) -> String {
+        format!(
+            r#"{{"type":"message","id":"m1","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// The picker's rows come off each session file's head: the `session`
+    /// header's id and cwd, the `title` record's title, and the first user
+    /// message's text (whitespace-collapsed).
+    #[test]
+    fn sessions_become_resume_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let body = [
+            title_record("wire up the parser"),
+            header("01a1065d-e96c-77d4-97b9-1522081134c0", "/home/miao/p", None),
+            user_message("  add   a test\\nfor the parser  "),
+        ]
+        .join("\n");
+        write_session(
+            &root,
+            "-home-miao-p",
+            "2026-01-01T00-00-00Z_x.jsonl",
+            &body,
+            100,
+        );
+
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "01a1065d-e96c-77d4-97b9-1522081134c0");
+        assert_eq!(out[0].cwd, "/home/miao/p");
+        assert_eq!(out[0].custom_title.as_deref(), Some("wire up the parser"));
+        assert_eq!(
+            out[0].first_prompt.as_deref(),
+            Some("add a test for the parser")
+        );
+        assert_eq!(out[0].git_branch, None);
+        assert_eq!(out[0].agent, AgentControl::Omp);
+    }
+
+    /// The `title` record is optional — a brand-new session has none — and the
+    /// header's own `title` is the fallback, so a header-only file still yields
+    /// a row.
+    #[test]
+    fn the_title_record_is_optional_and_the_header_title_is_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        write_session(
+            &root,
+            "k",
+            "a.jsonl",
+            &[
+                header("id-a", "/home/miao/p", Some("header title")),
+                user_message("first"),
+            ]
+            .join("\n"),
+            200,
+        );
+        write_session(
+            &root,
+            "k",
+            "b.jsonl",
+            &[header("id-b", "/home/miao/p", None), user_message("second")].join("\n"),
+            100,
+        );
+
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].session_id, "id-a");
+        assert_eq!(out[0].custom_title.as_deref(), Some("header title"));
+        assert_eq!(out[1].session_id, "id-b");
+        assert_eq!(out[1].custom_title, None);
+    }
+
+    /// A file with no `session` header, or a header naming no id or cwd, is
+    /// skipped — a candidate that resumes into the wrong place is worse than no
+    /// row, the same policy as every other backend.
+    #[test]
+    fn a_file_without_a_usable_session_header_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        write_session(
+            &root,
+            "k",
+            "no-header.jsonl",
+            &[title_record("t"), user_message("prompt")].join("\n"),
+            300,
+        );
+        write_session(
+            &root,
+            "k",
+            "no-cwd.jsonl",
+            &[header("id-x", "", None), user_message("prompt")].join("\n"),
+            200,
+        );
+        write_session(
+            &root,
+            "k",
+            "no-id.jsonl",
+            &[header("", "/home/miao/p", None), user_message("prompt")].join("\n"),
+            100,
+        );
+
+        assert!(list_resumable_in(&root, 10).is_empty());
+    }
+
+    /// The same-stem **directory** beside each session file is omp's artifact
+    /// and subagent store, not another session; neither it nor a `.jsonl` inside
+    /// it may become a picker row.
+    #[test]
+    fn the_sibling_artifact_directory_is_not_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let body = [header("stem", "/home/miao/p", None), user_message("prompt")].join("\n");
+        let file = write_session(&root, "-home-miao-p", "stem.jsonl", &body, 100);
+        let sibling = file.with_extension("");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("sub.jsonl"), &body).unwrap();
+
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, "stem");
+    }
+
+    /// `thinking_level_change`, `model_usage`, `custom_message` and an earlier
+    /// assistant message all precede the first prompt and must be skipped;
+    /// the first `user` message is the prompt.
+    #[test]
+    fn leading_non_user_lines_are_skipped_to_the_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let body = [
+            title_record("t"),
+            header("id", "/home/miao/p", None),
+            r#"{"type":"thinking_level_change","thinkingLevel":"high"}"#.to_string(),
+            r#"{"type":"model_usage","role":"judge"}"#.to_string(),
+            r#"{"type":"custom_message","customType":"prelude","content":"ignore me"}"#
+                .to_string(),
+            r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}"#
+                .to_string(),
+            user_message("the real prompt"),
+        ]
+        .join("\n");
+        write_session(&root, "k", "s.jsonl", &body, 100);
+
+        let out = list_resumable_in(&root, 10);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].first_prompt.as_deref(), Some("the real prompt"));
+    }
+
+    /// Candidates come out newest first and stop at `limit` **valid** rows — a
+    /// newer headerless file is skipped without spending one of the slots.
+    #[test]
+    fn candidates_come_out_newest_first_and_respect_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        for (id, secs) in [("old", 100), ("mid", 200), ("new", 300)] {
+            let body = [header(id, "/home/miao/p", None), user_message("prompt")].join("\n");
+            write_session(&root, "k", &format!("{id}.jsonl"), &body, secs);
+        }
+        // Newer than all three, and no session header: must not take a slot.
+        write_session(
+            &root,
+            "k",
+            "junk.jsonl",
+            &[user_message("no header")].join("\n"),
+            400,
+        );
+
+        let ids: Vec<String> = list_resumable_in(&root, 10)
+            .into_iter()
+            .map(|c| c.session_id)
+            .collect();
+        assert_eq!(ids, ["new", "mid", "old"]);
+
+        let two = list_resumable_in(&root, 2);
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].session_id, "new");
+        assert_eq!(two[1].session_id, "mid");
+        assert_eq!(
+            list_resumable_in(&root, 3).len(),
+            3,
+            "a headerless file must not consume one of the limit's slots"
+        );
+        assert!(list_resumable_in(&root, 0).is_empty());
     }
 }

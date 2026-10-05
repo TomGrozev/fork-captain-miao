@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **An omp question reads as a Decision** and rings for attention, rather
+  than looking like a session doing work.
+- **omp sessions appear in the resume picker**, with their title and first
+  prompt.
+
 ## [0.11.0] - 2026-10-03
 
 ### Added
