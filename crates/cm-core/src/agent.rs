@@ -1452,11 +1452,12 @@ impl AgentControl {
             // and no tier to put the row in. Unlike Pi's, this one has something
             // to wire up if that list ever appears.
             AgentControl::Antigravity => None,
-            // `None` for a sharper reason than pi's: omp *does* run background
-            // work (async bash jobs, `task` spawns) and `session_stop` is even
-            // deferred until they are idle — but nothing enumerates them on any
-            // payload we receive, so there is no shell to name and no tier to
-            // put the row in.
+            // The live list is applied at Stop in `omp::dispatch_hook` rather
+            // than here: the extension reads omp's in-process async jobs
+            // (`ctx.getAsyncJobSnapshot()`) and rides them on the `agent_end`
+            // payload, so the answer already arrives with the turn end. A
+            // pid-only tree walk is not the source and would disagree with the
+            // agent that just decided the turn is over — Grok's reason.
             AgentControl::Omp => None,
             AgentControl::Unknown => None,
         }

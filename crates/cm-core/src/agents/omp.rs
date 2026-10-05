@@ -2,15 +2,16 @@
 //! hook payload shape; the dashboard reaches all of it only via
 //! `crate::agent::AgentControl::Omp`'s match arms.
 //!
-//! **Source-verified against the installed binary**, `omp` v17.3.7 at
+//! **Source-verified against the installed binary**, `omp` v18.4.8 at
 //! `/opt/homebrew/bin/omp` — a Bun-compiled single executable whose JS source
 //! and Markdown docs are embedded and readable (`strings -a` on the binary;
-//! `omp read omp://<doc>`). `pi` 0.84.2 is separately installed at
+//! `omp read omp://<doc>`, e.g. `omp://extensions.md` for
+//! `getAsyncJobSnapshot()`). `pi` 0.84.2 is separately installed at
 //! `/opt/homebrew/bin/pi`; the two are distinct binaries with distinct state
 //! dirs (`~/.omp` vs `~/.pi`), so nothing about the pi backend changes. This
 //! module is built on the same `-e <extension.ts>` injection pi uses — **not**
 //! a parameterization of `pi.rs`: omp's event surface has diverged from pi's
-//! in four load-bearing ways (below), so the two modules share only what
+//! in five load-bearing ways (below), so the two modules share only what
 //! already lives in `agents::common`.
 //!
 //! omp is, like pi, **neither a synthetic home nor a shell hook**, and for
@@ -77,6 +78,28 @@
 //! that touches status only to settle a row out of `Starting` — so it adopts
 //! the new session id and moves nothing, which is precisely what is wanted.
 //!
+//! ## 5. `ctx.getAsyncJobSnapshot()` is the only enumerator of live async work
+//!
+//! omp tracks async jobs **in-process**: `getAsyncJobSnapshot()` returns
+//! `{ running, recent, delivery }`, and `running` is already filtered to the
+//! live set, so the extension reads it and rides it on the `agent_end` payload
+//! as `async_jobs` (beside `will_continue`). `omp ps` **is** machine-readable
+//! (`--json`), but it enumerates a different tier: per-project *named services*,
+//! read from a runtime directory of `meta.json` files or from the live broker,
+//! whose only session linkage is one `owner` field (a session id, or an
+//! agent-registry id such as `"Main"`). Async jobs never appear there, and
+//! never touch the disk — so no tree walk and no file read could find them, and
+//! a terminal `Stop` that still has bash jobs or `task` spawns running has no
+//! other witness. The payload list is the source. The `Stop` arm turns it into
+//! a tier — `Task` / `Server` / `Review` — instead of `Idle`.
+//!
+//! An `agent_end` with `willContinue` (omp's `awaitingAsyncWork`) is *not* this
+//! case: it is already remapped to `PostToolUse` (divergence 1), so the tier is
+//! decided only at the genuine terminal `Stop` — the one that can arrive with
+//! work still running. And because a `bash` job's label *is* its command text,
+//! an `r3 watch` run as a bash job still reads `Review` through the shared
+//! text classifier, exactly as Grok's payload list does.
+//!
 //! # Unchanged from pi
 //!
 //! `-e/--extension <path>` (repeatable), `before_agent_start` carrying
@@ -130,9 +153,10 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+use super::claude;
 use super::common;
 use super::pi_extension::Extension;
-use crate::agent::ResumeCandidate;
+use crate::agent::{BgSeedKind, BgShell, ResumeCandidate};
 use crate::state::{HookEvent, HookMessage, LauncherState, SessionStatus};
 
 /// The executable this backend drives — see [`super::claude::BIN`].
@@ -215,7 +239,12 @@ const FORWARDED: &[(&str, HookEvent)] = &[
 const EXTENSION: Extension = Extension {
     agent: BIN,
     events: FORWARDED,
-    extra_fields: &[("will_continue", "event?.willContinue")],
+    extra_fields: &[
+        ("will_continue", "event?.willContinue"),
+        // The session's live async-job list, read from the extension context.
+        // `running` is already the live-only set (see `shells_from_stop`).
+        ("async_jobs", "ctx?.getAsyncJobSnapshot?.()?.running"),
+    ],
 };
 
 /// The "hook settings" the launcher writes to its per-session file — for omp,
@@ -269,6 +298,7 @@ pub fn build_launch_command(
 /// `pi.getSessionName()`, `ctx.cwd`, `event.toolName` (the tool-execution
 /// events), `event.prompt` (`before_agent_start`), `event.isError`
 /// (`tool_execution_end`), `event.willContinue` (`agent_end`),
+/// `ctx.getAsyncJobSnapshot()` (the live async-job list),
 /// `ctx.getContextUsage().tokens` and `ctx.model.id`.
 #[derive(Deserialize)]
 struct HookPayload {
@@ -285,6 +315,21 @@ struct HookPayload {
     /// Set on an `agent_end` that omp will follow with more work of its own.
     #[serde(default)]
     will_continue: bool,
+    /// The session's running async jobs at a turn end, when the extension
+    /// could read them — absent on an omp that predates `getAsyncJobSnapshot`.
+    #[serde(default)]
+    async_jobs: Option<Vec<AsyncJob>>,
+}
+
+/// One entry of the extension's `async_jobs` array — omp's
+/// `AsyncJobSnapshot.running` item, of which only these two fields bear on the
+/// tier decision. `label` is a bash job's own command text (omp truncates it
+/// at 120 chars), and a description for the other kinds.
+#[derive(Deserialize)]
+struct AsyncJob {
+    #[serde(rename = "type")]
+    job_type: Option<String>,
+    label: Option<String>,
 }
 
 /// Normalize one omp hook payload, as sent by the generated extension.
@@ -345,17 +390,88 @@ fn normalize_event(event: HookEvent, payload: &HookPayload) -> HookEvent {
 }
 
 // =============================================================================
+// The Stop payload's async-job list
+// =============================================================================
+
+/// The session's running background work as the Stop payload named it, or
+/// `None` when the payload named no list at all.
+///
+/// Mirror Grok's `shells_from_stop`: `Some` (even empty) is the turn end
+/// reporting what is in flight, `None` is a payload with nothing to say —
+/// either an omp that predates `getAsyncJobSnapshot`, or an extension context
+/// no session owns. The distinction is load-bearing for the Stop arm below.
+fn shells_from_stop(raw: Option<&str>) -> Option<Vec<BgShell>> {
+    let payload: HookPayload = serde_json::from_str(raw?).ok()?;
+    let jobs = payload.async_jobs?;
+    Some(jobs.iter().map(shell_from_job).collect())
+}
+
+/// One async job as a shell. A `bash` job's label *is* its command, so the
+/// shared command-form heuristic applies and an `r3 watch` still reads
+/// `Review`; every other kind — `task`, `eval`, or a type omp adds later — is
+/// busy work by construction. A job is never dropped for having an unfamiliar
+/// type: dropping a running job is the silent failure this exists to prevent.
+fn shell_from_job(job: &AsyncJob) -> BgShell {
+    let label = job
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let kind = match job.job_type.as_deref() {
+        Some("bash") => {
+            let command = label.unwrap_or("bash");
+            if claude::is_r3_watch_command(command) {
+                BgSeedKind::ReviewWatch
+            } else if claude::is_long_running_command(command) {
+                BgSeedKind::LongRunning
+            } else {
+                BgSeedKind::Other
+            }
+        }
+        _ => BgSeedKind::Other,
+    };
+    BgShell {
+        key: label
+            .or(job.job_type.as_deref())
+            .unwrap_or("job")
+            .to_string(),
+        kind,
+    }
+}
+
+/// Same precedence as the launcher's `classify_and_learn` (and Grok's `Stop`
+/// arm): any finite job keeps the row busy (`Task`); else any parked server is
+/// at-rest (`Server`); else every remaining job is an r3 review-watch (`Review`).
+fn status_from_shells(shells: &[BgShell]) -> SessionStatus {
+    if shells.iter().any(|s| s.kind == BgSeedKind::Other) {
+        SessionStatus::BackgroundActive
+    } else if shells.iter().any(|s| s.kind == BgSeedKind::LongRunning) {
+        SessionStatus::BackgroundServer
+    } else {
+        SessionStatus::ReviewPending
+    }
+}
+
+// =============================================================================
 // Hook event → status mapping
 // =============================================================================
 
-/// omp departs from [`common::dispatch_default`] in one place: [`ASK_TOOL`].
-/// The native → normalized renaming is done in the generated table
-/// ([`FORWARDED`]) rather than here, and the two payload-driven corrections are
-/// done in [`normalize_event`]. `agent_end` with a falsy `willContinue` means
-/// the shared `Stop` arm needs no help from a session file or a rollout scan,
-/// and the abort path settles too.
+/// omp departs from [`common::dispatch_default`] in two places: the `Stop` arm
+/// and [`ASK_TOOL`]. The native → normalized renaming is done in the generated
+/// table ([`FORWARDED`]) rather than here, and the two payload-driven
+/// corrections are done in [`normalize_event`]. `agent_end` with a falsy
+/// `willContinue` means the shared `Stop` arm needs no help from a session file
+/// or a rollout scan, and the abort path settles too.
 ///
-/// That one departure is `ask` — a blocking multiple-choice card, not work.
+/// The `Stop` arm is omp's background tier, the shape Grok's `Stop` arm takes.
+/// A genuine terminal turn end can arrive with async jobs still running, and
+/// [`shells_from_stop`] decides from the payload's live list whether the row is
+/// `Task` / `Server` / `Review` rather than `Idle`. A `Stop` that names no list
+/// (`None`) while the row already holds a background tier keeps that tier —
+/// absent evidence is not evidence the work ended, and the previous `Stop`
+/// already named it. An empty list is a turn end saying nothing is in flight.
+///
+/// The other departure is `ask` — a blocking multiple-choice card, not work.
 /// Like Grok's `ask_user_question` and Reasonix's `ask` it is surfaced as
 /// [`SessionStatus::WaitingForDecision`] ("Decision"), the same bucket as
 /// Claude's `AskUserQuestion` and Codex's `request_user_input`; without an arm
@@ -378,6 +494,34 @@ pub fn dispatch_hook(state: &mut LauncherState, mut msg: HookMessage) {
         state.last_tool = msg.tool_name;
         return;
     }
+
+    if msg.event == HookEvent::Stop {
+        match shells_from_stop(msg.raw.as_deref()) {
+            Some(shells) if !shells.is_empty() => {
+                common::adopt_session_facts(state, &mut msg);
+                state.last_tool = None;
+                state.status = status_from_shells(&shells);
+                return;
+            }
+            None if matches!(
+                state.status,
+                SessionStatus::BackgroundActive
+                    | SessionStatus::BackgroundServer
+                    | SessionStatus::ReviewPending
+            ) =>
+            {
+                // No list at all is not evidence the live work ended — the
+                // previous Stop already named it. Hold the background row
+                // rather than flashing Idle.
+                common::adopt_session_facts(state, &mut msg);
+                return;
+            }
+            // An empty list is a turn end saying nothing is in flight; absent
+            // on a non-background row is an ordinary settle.
+            Some(_) | None => {}
+        }
+    }
+
     common::dispatch_default(state, msg)
 }
 
@@ -841,6 +985,120 @@ mod tests {
             state.status,
             SessionStatus::Idle,
             "a final agent_end settles the row"
+        );
+    }
+
+    /// The extension reads omp's live async-job list from the context — the
+    /// only enumerator (divergence 5) — as a plain `ctx` expression, so no
+    /// per-session data is spliced into the shared file.
+    #[test]
+    fn the_source_reads_the_async_jobs_from_the_context() {
+        let source = EXTENSION.source(EXE);
+        assert!(
+            source.contains("async_jobs: ctx?.getAsyncJobSnapshot?.()?.running,"),
+            "{source}"
+        );
+        // Same file for every session, so this too is context, not spliced data
+        // — `the_source_carries_no_per_session_data` pins that separately.
+    }
+
+    /// The Stop list's classification: a bash job's label *is* its command, so
+    /// the shared text heuristic decides the tier; every other kind is busy
+    /// work; and a job is never dropped for a missing label or unknown type —
+    /// dropping a running job is the silent failure this exists to prevent.
+    #[test]
+    fn shells_from_stop_classifies_each_job_and_never_drops_one() {
+        let raw = r#"{"async_jobs":[
+            {"type":"bash","label":"r3 watch review_abc123"},
+            {"type":"bash","label":"npm run dev"},
+            {"type":"bash","label":"cargo build"},
+            {"type":"task","label":"refactor the parser"},
+            {"type":"eval","label":""},
+            {"type":"future-kind","label":"something new"},
+            {"type":"bash"}
+        ]}"#;
+        let shells = shells_from_stop(Some(raw)).expect("the key is present");
+        let kinds: Vec<BgSeedKind> = shells.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                BgSeedKind::ReviewWatch,
+                BgSeedKind::LongRunning,
+                BgSeedKind::Other,
+                BgSeedKind::Other,
+                BgSeedKind::Other,
+                BgSeedKind::Other,
+                BgSeedKind::Other,
+            ]
+        );
+        // A bash job's key is its command text; a label-less bash still yields a
+        // non-empty key so the job is named rather than dropped.
+        assert_eq!(shells[0].key, "r3 watch review_abc123");
+        assert_eq!(shells[2].key, "cargo build");
+        assert_eq!(shells[4].key, "eval");
+        assert_eq!(shells[5].key, "something new");
+        assert_eq!(shells[6].key, "bash");
+    }
+
+    /// `Some` even when empty is the turn end reporting nothing in flight;
+    /// `None` is a payload that named no list (an older omp, or an extension
+    /// context no session owns) — the distinction the Stop arm leans on.
+    #[test]
+    fn shells_from_stop_distinguishes_an_empty_list_from_no_list() {
+        assert_eq!(shells_from_stop(Some(r#"{"async_jobs":[]}"#)), Some(vec![]));
+        // An absent key, an absent payload and an unparseable body are all
+        // "nothing to say".
+        assert_eq!(shells_from_stop(Some(r#"{"will_continue":false}"#)), None);
+        assert_eq!(shells_from_stop(None), None);
+        assert_eq!(shells_from_stop(Some("not json")), None);
+    }
+
+    /// **The feature, end to end.** A terminal `Stop` that still has async jobs
+    /// running must land the row on the tier the list implies — `Server` /
+    /// `Review` / `Task` — not `Idle`; an empty list settles; and a `Stop`
+    /// naming no list holds an already-background row rather than flashing
+    /// `Idle`.
+    #[test]
+    fn a_stop_with_live_async_jobs_lands_on_the_matching_tier() {
+        let server = r#"{"async_jobs":[{"type":"bash","label":"npm run dev"}]}"#;
+        let mut state = state_at(SessionStatus::Active);
+        feed(&mut state, HookEvent::Stop, server);
+        assert_eq!(state.status, SessionStatus::BackgroundServer);
+
+        let review = r#"{"async_jobs":[{"type":"bash","label":"r3 watch review_abc123"}]}"#;
+        let mut state = state_at(SessionStatus::Active);
+        feed(&mut state, HookEvent::Stop, review);
+        assert_eq!(state.status, SessionStatus::ReviewPending);
+
+        let task = r#"{"async_jobs":[{"type":"task","label":"refactor the parser"}]}"#;
+        let mut state = state_at(SessionStatus::Active);
+        feed(&mut state, HookEvent::Stop, task);
+        assert_eq!(state.status, SessionStatus::BackgroundActive);
+
+        // An empty list is a turn end saying nothing is in flight.
+        let mut state = state_at(SessionStatus::Active);
+        feed(&mut state, HookEvent::Stop, r#"{"async_jobs":[]}"#);
+        assert_eq!(state.status, SessionStatus::Idle);
+
+        // No list at all while already on a background tier: hold it there — the
+        // previous Stop already named the live work.
+        let mut state = state_at(SessionStatus::BackgroundServer);
+        feed(&mut state, HookEvent::Stop, r#"{"will_continue":false}"#);
+        assert_eq!(state.status, SessionStatus::BackgroundServer);
+    }
+
+    /// A `Stop` carrying `will_continue: true` is still the `PostToolUse`
+    /// remap (divergence 1), so its async-job list must not settle or classify
+    /// the row — it stays `Active`.
+    #[test]
+    fn a_continuing_stop_does_not_classify_its_async_jobs() {
+        let raw = r#"{"will_continue":true,"async_jobs":[{"type":"bash","label":"npm run dev"}]}"#;
+        let mut state = state_at(SessionStatus::Active);
+        feed(&mut state, HookEvent::Stop, raw);
+        assert_eq!(
+            state.status,
+            SessionStatus::Active,
+            "a continuing agent_end must not take the async-job tier"
         );
     }
 
